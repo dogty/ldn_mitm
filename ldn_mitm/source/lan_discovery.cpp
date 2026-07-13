@@ -78,6 +78,15 @@ namespace ams::mitm::ldn {
                         break;
                     }
                     std::scoped_lock lock(this->discovery->dataMutex);
+                    /* A relay (lan-play) can echo our own advertisement back
+                       at us. Real ldn never shows you your own network, and a
+                       game that picks it from the scan results would try to
+                       join itself (Street Fighter 30th AC does exactly this),
+                       so it must never reach the game. */
+                    if (this->selfIp != 0 && info->ldn.nodes[0].ipv4Address == this->selfIp) {
+                        LogFormat("ScanResp: ignoring our own network (echoed back by relay)");
+                        break;
+                    }
                     this->scanResults.insert({info->common.bssid, *info});
                     break;
                 }
@@ -135,6 +144,10 @@ namespace ams::mitm::ldn {
 
     void LDTcpSocket::onClose() {
         LogFormat("LDTcpSocket::onClose");
+        /* Take the dead socket out of the poll set. Without this the fd
+           stays readable at EOF and the worker re-enters onRead/onClose in
+           a tight loop until the game finalizes. */
+        this->close();
         this->discovery->onDisconnectFromHost();
     }
 
@@ -189,6 +202,10 @@ namespace ams::mitm::ldn {
     void LANDiscovery::onDisconnectFromHost() {
         LogFormat("onDisconnectFromHost state: %d", static_cast<int>(this->state));
         if (this->state == CommState::StationConnected) {
+            /* Real ldn reports why the station left the network; without
+               this the game polls GetDisconnectReason, sees None and may
+               wait forever instead of showing its error UI. */
+            this->disconnect_reason = DisconnectReason::SignalLost;
             this->setState(CommState::Station);
         }
     }
@@ -399,6 +416,14 @@ namespace ams::mitm::ldn {
         {
             std::scoped_lock lock(this->dataMutex);
             this->udp->scanResults.clear();
+            /* Refresh our own IP so the ScanResp handler can drop our own
+               advertisement when a relay (lan-play) echoes it back at us. */
+            u32 myIp = 0;
+            if (R_SUCCEEDED(nifmGetCurrentIpAddress(&myIp))) {
+                this->udp->selfIp = ntohl(myIp);
+            } else {
+                this->udp->selfIp = 0;
+            }
         }
 
         /* Broadcast a few times (UDP may drop packets) and exit early once
@@ -999,6 +1024,12 @@ namespace ams::mitm::ldn {
            game's session layer failing (e.g. 2618-0006). Lowering the MTU in
            settings now actually takes effect. We still force 1500 only when
            the profile reports an unusable value. */
+        /* Games can REQUIRE a large MTU: SF 30th AC's session layer (pia)
+           refuses to run when the interface MTU is below its minimum — the
+           host joins fine, then ignores all peer traffic and errors with
+           2618-0006. Lowering the MTU (as lan-play guides recommend) is what
+           breaks these games, so never clamp it down here; respect the
+           profile and only fix unusable values. */
         int desiredMtu = originalMtu;
         if (desiredMtu == 0 || desiredMtu > 1500) {
             desiredMtu = 1500;
