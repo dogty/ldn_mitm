@@ -216,7 +216,9 @@ namespace ams {
 
             /* Initialize other services. */
 
-            R_ABORT_UNLESS(nifmInitialize(NifmServiceType_Admin));
+            /* nifm is acquired lazily via NifmSessionManager: nifm:a only
+               allows two sessions system-wide, and holding one forever
+               starves the console's own network settings/connection test. */
             R_ABORT_UNLESS(bsdInitialize(&LibnxBsdInitConfig, LibnxSocketInitConfig.num_bsd_sessions, LibnxSocketInitConfig.bsd_service_type));
             R_ABORT_UNLESS(socketInitialize(&LibnxSocketInitConfig));
         }
