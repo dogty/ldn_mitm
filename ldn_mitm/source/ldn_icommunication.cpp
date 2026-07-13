@@ -209,6 +209,15 @@ namespace ams::mitm::ldn {
         return 0;
     }
 
+    Result ICommunicationService::SetProtocol(u32 protocol) {
+        /* [20.0.0+] Newer SDK games (e.g. Animal Crossing 3.0.0) select the
+           ldn protocol before initializing: 0/1 = NX, 3 = Switch 2. We only
+           emulate the NX protocol, but the call must succeed or the game
+           errors out before ever reaching Initialize. */
+        LogFormat("SetProtocol %u", protocol);
+        return 0;
+    }
+
     Result ICommunicationService::Reject() {
         return 0;
     }
