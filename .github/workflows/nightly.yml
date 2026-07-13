@@ -3,6 +3,8 @@ name: Nightly
 on:
   schedule:
     - cron: "0 0 * * *"
+  # Scheduled workflows are disabled by default on forks; allow manual runs.
+  workflow_dispatch:
 
 jobs:
   build:
