@@ -11,8 +11,14 @@ namespace ams::mitm::ldn {
             static bool getEnabled() {
                 return LdnEnabled;
             }
+            /* Broadcast->unicast fan-out for the bsd:u mitm. On by default;
+               toggle at runtime via the config service / overlay. */
+            static bool getBroadcastRelay() {
+                return BroadcastRelay;
+            }
         protected:
             static std::atomic_bool LdnEnabled;
+            static std::atomic_bool BroadcastRelay;
         public:
 
             Result GetVersion(sf::Out<LdnMitmVersion> version);
@@ -20,6 +26,8 @@ namespace ams::mitm::ldn {
             Result SetLogging(u32 enabled);
             Result GetEnabled(sf::Out<u32> enabled);
             Result SetEnabled(u32 enabled);
+            Result GetBroadcastRelay(sf::Out<u32> enabled);
+            Result SetBroadcastRelay(u32 enabled);
     };
     static_assert(ams::mitm::ldn::IsILdnConfig<LdnConfig>);
 

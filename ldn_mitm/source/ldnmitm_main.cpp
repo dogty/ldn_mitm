@@ -32,6 +32,7 @@ extern "C" {
 }
 
 #include "ldnmitm_service.hpp"
+#include "bsd_mitm_service.hpp"
 
 namespace ams {
 
@@ -87,7 +88,15 @@ namespace ams {
     namespace mitm {
 
         const s32 ThreadPriority = 6;
-        const size_t TotalThreads = 2;
+        /* bsd:u has blocking commands (Recv/RecvFrom/Poll/Select/Accept). We
+           mitm bsd:u and forward those verbatim, which blocks the forwarding
+           thread inside the real service until it returns. A netplay game
+           keeps threads parked in blocking recv/poll, so with the old pool of
+           2 these were all consumed and no thread was left to accept the next
+           application's bsd:u session -> it hung at boot (blank screen, force
+           shutdown needed). Give the pool enough headroom that parked forwards
+           cannot starve session acceptance. */
+        const size_t TotalThreads = 8;
         const size_t NumExtraThreads = TotalThreads - 1;
         const size_t ThreadStackSize = 0x4000;
 
@@ -136,9 +145,18 @@ namespace ams {
                 static constexpr bool   CanManageMitmServers  = true;
             };
 
-            constexpr size_t MaxSessions = 3;
+            /* Two mitm ports now: ldn:u (sleepy) and bsd:u (busy - every
+               game's sockets). bsd:u needs many more concurrent sessions than
+               ldn ever did; undersizing would make us REFUSE bsd sessions and
+               break game networking outright. */
+            enum PortIndex {
+                PortIndex_Ldn = 0,
+                PortIndex_Bsd = 1,
+                PortIndex_Count,
+            };
+            constexpr size_t MaxSessions = 0x20;
 
-            class ServerManager final : public sf::hipc::ServerManager<1, LdnMitmManagerOptions, MaxSessions> {
+            class ServerManager final : public sf::hipc::ServerManager<PortIndex_Count, LdnMitmManagerOptions, MaxSessions> {
                         private:
                             virtual ams::Result OnNeedsToAccept(int port_index, Server *server) override;
             };
@@ -146,12 +164,18 @@ namespace ams {
             ServerManager g_server_manager;
 
             Result ServerManager::OnNeedsToAccept(int port_index, Server *server) {
-                AMS_UNUSED(port_index);
                 /* Acknowledge the mitm session. */
                 std::shared_ptr<::Service> fsrv;
                 sm::MitmProcessInfo client_info;
                 server->AcknowledgeMitmSession(std::addressof(fsrv), std::addressof(client_info));
-                return this->AcceptMitmImpl(server, sf::CreateSharedObjectEmplaced<mitm::ldn::ILdnMitMService, mitm::ldn::LdnMitMService>(decltype(fsrv)(fsrv), client_info), fsrv);
+
+                switch (port_index) {
+                    case PortIndex_Ldn:
+                        return this->AcceptMitmImpl(server, sf::CreateSharedObjectEmplaced<mitm::ldn::ILdnMitMService, mitm::ldn::LdnMitMService>(decltype(fsrv)(fsrv), client_info), fsrv);
+                    case PortIndex_Bsd:
+                        return this->AcceptMitmImpl(server, sf::CreateSharedObjectEmplaced<mitm::ldn::IBsdMitmInterface, mitm::ldn::BsdMitmService>(decltype(fsrv)(fsrv), client_info), fsrv);
+                    AMS_UNREACHABLE_DEFAULT_CASE();
+                }
             }
 
             alignas(os::MemoryPageSize) u8 g_extra_thread_stacks[NumExtraThreads][ThreadStackSize];
@@ -241,9 +265,11 @@ namespace ams {
         R_ABORT_UNLESS(log::Initialize());
         LogFormat("main");
 
-        constexpr sm::ServiceName MitmServiceName = sm::ServiceName::Encode("ldn:u");
-        //sf::hipc::ServerManager<2, LdnMitmManagerOptions, 3> server_manager;
-        R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::LdnMitMService>(0, MitmServiceName)));
+        constexpr sm::ServiceName LdnMitmServiceName = sm::ServiceName::Encode("ldn:u");
+        R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::LdnMitMService>(mitm::PortIndex_Ldn, LdnMitmServiceName)));
+
+        constexpr sm::ServiceName BsdMitmServiceName = sm::ServiceName::Encode("bsd:u");
+        R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::BsdMitmService>(mitm::PortIndex_Bsd, BsdMitmServiceName)));
         LogFormat("registered");
 
         R_ABORT_UNLESS(os::CreateThread(
