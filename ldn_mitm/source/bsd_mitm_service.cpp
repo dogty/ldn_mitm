@@ -17,10 +17,13 @@
 #include "bsd_mitm_service.hpp"
 #include "session_registry.hpp"
 #include "ldnmitm_config.hpp"
+#include "relay_client.hpp"
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <atomic>
+#include <cstring>
 
 namespace ams::mitm::ldn {
 
@@ -109,6 +112,54 @@ namespace ams::mitm::ldn {
     }
 
     Result BsdMitmService::Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out) {
+        /* Wake for a queued relay frame: if we have game data and the game is
+           polling its session socket, re-poll immediately (timeout 0) to get
+           real readiness for the other fds, then force POLLIN on the game fd
+           so the game proceeds to RecvFrom (where we serve the queued frame).
+           Without this the real socket is never readable - peer traffic comes
+           via the relay, not the socket - so the game would never recv. */
+        if (relay::IsEnabled() && GameRx::HasData()) {
+            const s32 gfd = GameRx::GameFd();
+            const size_t need = static_cast<size_t>(nfds) * sizeof(struct pollfd);
+            if (gfd >= 0 && fds_in.GetSize() >= need && fds_out.GetSize() >= need) {
+                const auto *pin = reinterpret_cast<const struct pollfd *>(fds_in.GetPointer());
+                bool present = false;
+                for (u32 i = 0; i < nfds; i++) {
+                    if (pin[i].fd == gfd) { present = true; break; }
+                }
+                if (present) {
+                    const struct { u32 nfds; s32 timeout; } in = { nfds, 0 };
+                    BsdOutData out = {};
+                    ::Service *fwd = this->m_forward_service.get();
+                    R_TRY((serviceDispatchInOut(fwd, 6, in, out,
+                        .buffer_attrs = {
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                        },
+                        .buffers = {
+                            { fds_in.GetPointer(),  fds_in.GetSize()  },
+                            { fds_out.GetPointer(), fds_out.GetSize() },
+                        },
+                    )));
+                    if (out.ret >= 0) {
+                        auto *pout = reinterpret_cast<struct pollfd *>(fds_out.GetPointer());
+                        for (u32 i = 0; i < nfds; i++) {
+                            if (pout[i].fd == gfd) {
+                                if ((pout[i].revents & POLLIN) == 0) {
+                                    pout[i].revents |= POLLIN;
+                                    out.ret += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    ret.SetValue(out.ret);
+                    bsd_errno.SetValue(out.bsd_errno);
+                    R_SUCCEED();
+                }
+            }
+        }
+
         /* Bounded timeout: forward the original request verbatim. */
         if (timeout >= 0 && timeout <= ForwardMaxMs) {
             R_RETURN(sm::mitm::ResultShouldForwardToSession());
@@ -147,63 +198,129 @@ namespace ams::mitm::ldn {
         R_SUCCEED();
     }
 
+    Result BsdMitmService::RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr) {
+        /* Serve a relay-received peer frame with the peer's REAL source
+           address, if one is queued for this game socket. Bypasses the network
+           stack (which cannot deliver a spoofed source locally). Otherwise
+           forward verbatim - non-game sockets and the empty-queue case behave
+           exactly as before, so unrelated recv traffic is untouched. */
+        if (relay::IsEnabled() &&
+            (flags & MSG_PEEK) == 0 &&               /* don't consume on a peek */
+            src_addr.GetSize() >= sizeof(struct sockaddr_in) &&
+            GameRx::HasData()) {                     /* peer frames are waiting */
+
+            /* Bootstrap the game socket fd from the receive side: a recv while
+               peer frames are queued is the game waiting on its session socket
+               (the joiner never broadcasts first, so SendTo can't record it).
+               HasData() is only true during an active relay session, so this
+               cannot mis-fire for unrelated games. */
+            if (GameRx::GameFd() < 0) {
+                GameRx::SetGameFd(sockfd);
+                LogFormat("bsd RecvFrom: bootstrapped game fd %d from recv", sockfd);
+            }
+
+            if (sockfd != GameRx::GameFd()) {
+                R_RETURN(sm::mitm::ResultShouldForwardToSession());
+            }
+
+            u32 src_ip = 0; u16 sport = 0; size_t out_len = 0;
+            u8 tmp[GameRx::MaxPayload];
+            if (GameRx::Pop(&src_ip, &sport, nullptr, tmp, sizeof(tmp), &out_len)) {
+                const size_t n = out_len < message.GetSize() ? out_len : message.GetSize();
+                std::memcpy(message.GetPointer(), tmp, n);
+
+                struct sockaddr_in sa = {};
+                sa.sin_family = AF_INET;
+                sa.sin_port = htons(sport);
+                sa.sin_addr.s_addr = htonl(src_ip);
+                std::memcpy(src_addr.GetPointer(), std::addressof(sa), sizeof(sa));
+
+                ret.SetValue(static_cast<s32>(n));
+                bsd_errno.SetValue(0);
+                addrlen.SetValue(static_cast<u32>(sizeof(sa)));
+
+                R_SUCCEED();
+            }
+        }
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
     Result BsdMitmService::SendTo(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, sf::InAutoSelectBuffer message, sf::InAutoSelectBuffer dst_addr) {
         AMS_UNUSED(ret, bsd_errno);
 
-        /* Only care about IPv4 sends with a full sockaddr_in, and only when
-           the broadcast relay is enabled. Anything else falls straight
-           through to the real service. */
-        if (LdnConfig::getBroadcastRelay() && dst_addr.GetSize() >= sizeof(struct sockaddr_in)) {
+        /* Two independent consumers of the game's sends: the LAN broadcast
+           fan-out (broadcast->unicast for WiFi reliability) and the internet
+           relay (carry session traffic to peers on other networks). Enter if
+           either is active; the internet relay is NOT gated on the broadcast
+           relay toggle. Anything else falls straight through. */
+        const bool want_fanout = LdnConfig::getBroadcastRelay();
+        const bool want_relay  = relay::IsEnabled();
+        if ((want_fanout || want_relay) && dst_addr.GetSize() >= sizeof(struct sockaddr_in)) {
             const auto *sa = reinterpret_cast<const struct sockaddr_in *>(dst_addr.GetPointer());
             if (sa->sin_family == AF_INET) {
                 const u32 ip = ntohl(sa->sin_addr.s_addr);
+                const u16 port = ntohs(sa->sin_port);
 
                 SessionRegistry::Snapshot snap;
                 SessionRegistry::Get(std::addressof(snap));
 
                 const bool is_bcast = (ip == 0xFFFFFFFFu) || (snap.active && ip == snap.bcast_ip);
 
-                if (snap.active && snap.peer_count > 0 && is_bcast) {
-                    /* Broadcast during an active LDN session: additionally
-                       deliver a unicast copy to each known peer. WiFi delivers
-                       unicast reliably (ACKed, full-rate, no DTIM), unlike the
-                       AP's broadcast re-flood which is lossy and slow. We do
-                       NOT suppress the original broadcast: it is still
-                       forwarded below, so the game keeps exact SendTo semantics
-                       (it gets the real broadcast's ret/errno) and any peer we
-                       don't yet know about is still covered. Duplicate arrivals
-                       are harmless for these protocols. */
-                    ::Service *fwd = this->m_forward_service.get();
+                /* Internet relay, unicast: some games broadcast only a brief
+                   handshake, then switch to unicast to the peer's IP (from
+                   NodeInfo) - unroutable across the internet, so relay it; the
+                   relay routes a unicast frame to the client owning that dst. */
+                if (want_relay && snap.active && !is_bcast && ip != 0 && ip != 0x7F000001u) {
                     for (int i = 0; i < snap.peer_count; i++) {
-                        struct sockaddr_in peer = *sa;
-                        peer.sin_addr.s_addr = htonl(snap.peer_ips[i]);
-
-                        const struct {
-                            s32 sockfd;
-                            s32 flags;
-                        } in = { sockfd, flags };
-                        struct {
-                            s32 ret;
-                            s32 bsd_errno;
-                        } out = {};
-
-                        /* Mirrors libnx bsdSendTo (cmd 11): in {sockfd,flags},
-                           two AutoSelect-In buffers (payload, sockaddr), out
-                           {ret,errno}. Issued on the game's forward session so
-                           its fd table applies. Best-effort: result ignored. */
-                        serviceDispatchInOut(fwd, 11, in, out,
-                            .buffer_attrs = {
-                                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                            },
-                            .buffers = {
-                                { message.GetPointer(), message.GetSize() },
-                                { std::addressof(peer), sizeof(peer) },
-                            },
-                        );
+                        if (ip == snap.peer_ips[i]) {
+                            GameRx::SetGameFd(sockfd);
+                            relay::BridgeSendGameUnicast(message.GetPointer(), message.GetSize(), port, ip);
+                            break;
+                        }
                     }
-                    LogFormat("bsd SendTo fanout %d peer(s) fd %d len %zu",
-                        snap.peer_count, sockfd, message.GetSize());
+                }
+
+                if (snap.active && snap.peer_count > 0 && is_bcast) {
+                    /* LAN broadcast fan-out: deliver a unicast copy to each
+                       known peer. WiFi delivers unicast reliably (ACKed,
+                       full-rate, no DTIM) unlike the AP's lossy broadcast
+                       re-flood. The original broadcast is still forwarded
+                       below, so SendTo semantics stay exact and unknown peers
+                       remain covered; duplicates are harmless here. */
+                    if (want_fanout) {
+                        ::Service *fwd = this->m_forward_service.get();
+                        for (int i = 0; i < snap.peer_count; i++) {
+                            struct sockaddr_in peer = *sa;
+                            peer.sin_addr.s_addr = htonl(snap.peer_ips[i]);
+
+                            const struct { s32 sockfd; s32 flags; } in = { sockfd, flags };
+                            struct { s32 ret; s32 bsd_errno; } out = {};
+
+                            /* Mirrors libnx bsdSendTo (cmd 11): in {sockfd,flags},
+                               two AutoSelect-In buffers (payload, sockaddr), out
+                               {ret,errno}. Issued on the game's forward session
+                               so its fd table applies. Best-effort. */
+                            serviceDispatchInOut(fwd, 11, in, out,
+                                .buffer_attrs = {
+                                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                },
+                                .buffers = {
+                                    { message.GetPointer(), message.GetSize() },
+                                    { std::addressof(peer), sizeof(peer) },
+                                },
+                            );
+                        }
+                    }
+
+                    /* Internet relay, broadcast: carry it to peers on other
+                       networks (their real IPs are unroutable here), and record
+                       the game's session fd for the RecvFrom/Poll intercept. */
+                    if (want_relay) {
+                        GameRx::SetGameFd(sockfd);
+                        relay::BridgeSendGameBroadcast(message.GetPointer(), message.GetSize(), port);
+                    }
                 }
             }
         }

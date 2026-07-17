@@ -15,6 +15,8 @@
  */
 
 #include "session_registry.hpp"
+#include <mutex>
+#include <cstring>
 
 namespace ams::mitm::ldn {
 
@@ -37,13 +39,101 @@ namespace ams::mitm::ldn {
     }
 
     void SessionRegistry::Clear() {
-        std::scoped_lock lk(g_mutex);
-        g_state = {};
+        {
+            std::scoped_lock lk(g_mutex);
+            g_state = {};
+        }
+        /* The relay receive queue and game-socket fd share the session
+           lifetime; drop them together so a stale fd never gets served. */
+        GameRx::Clear();
     }
 
     void SessionRegistry::Get(Snapshot *out) {
         std::scoped_lock lk(g_mutex);
         *out = g_state;
+    }
+
+    /* ---- GameRx: internet-relay receive queue ---- */
+
+    namespace {
+        struct GameRxEntry {
+            u32 src_ip;
+            u16 sport;
+            u16 dport;
+            u16 len;
+            u8  data[GameRx::MaxPayload];
+        };
+        os::SdkMutex g_rx_mutex;
+        GameRxEntry g_rx_ring[GameRx::MaxEntries];
+        int g_rx_head = 0;   /* next pop */
+        int g_rx_count = 0;
+        s32 g_game_fd = -1;
+    }
+
+    void GameRx::SetGameFd(s32 fd) {
+        std::scoped_lock lk(g_rx_mutex);
+        g_game_fd = fd;
+    }
+
+    s32 GameRx::GameFd() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_game_fd;
+    }
+
+    void GameRx::Push(u32 src_ip, u16 sport, u16 dport, const void *data, size_t len) {
+        if (len == 0 || len > MaxPayload) {
+            return;
+        }
+        std::scoped_lock lk(g_rx_mutex);
+        /* Enqueue even before the game socket fd is known: on the JOINER the
+           game does not broadcast (so SendTo never records the fd) until it
+           has received the host's traffic - a deadlock if Push required the
+           fd. Queuing makes HasData() true, which lets RecvFrom bootstrap the
+           fd from the game's own recv and drain us. */
+        int slot;
+        if (g_rx_count == MaxEntries) {
+            /* full: drop oldest (advance head), reuse its slot at the tail */
+            g_rx_head = (g_rx_head + 1) % MaxEntries;
+            slot = (g_rx_head + g_rx_count - 1) % MaxEntries;
+        } else {
+            slot = (g_rx_head + g_rx_count) % MaxEntries;
+            g_rx_count++;
+        }
+        GameRxEntry &e = g_rx_ring[slot];
+        e.src_ip = src_ip;
+        e.sport = sport;
+        e.dport = dport;
+        e.len = static_cast<u16>(len);
+        std::memcpy(e.data, data, len);
+    }
+
+    bool GameRx::Pop(u32 *src_ip, u16 *sport, u16 *dport, void *out, size_t max_len, size_t *out_len) {
+        std::scoped_lock lk(g_rx_mutex);
+        if (g_rx_count == 0) {
+            return false;
+        }
+        const GameRxEntry &e = g_rx_ring[g_rx_head];
+        const size_t n = e.len < max_len ? e.len : max_len;
+        std::memcpy(out, e.data, n);
+        if (src_ip)  { *src_ip = e.src_ip; }
+        if (sport)   { *sport = e.sport; }
+        if (dport)   { *dport = e.dport; }
+        if (out_len) { *out_len = n; }
+        g_rx_head = (g_rx_head + 1) % MaxEntries;
+        g_rx_count--;
+        return true;
+    }
+
+    bool GameRx::HasData() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_rx_count > 0;
+    }
+
+    void GameRx::Clear() {
+        std::scoped_lock lk(g_rx_mutex);
+        g_rx_count = 0;
+        g_rx_head = 0;
+        g_game_fd = -1;
     }
 
 }

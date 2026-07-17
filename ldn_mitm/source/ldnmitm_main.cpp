@@ -33,6 +33,7 @@ extern "C" {
 
 #include "ldnmitm_service.hpp"
 #include "bsd_mitm_service.hpp"
+#include "relay_client.hpp"
 
 namespace ams {
 
@@ -61,6 +62,12 @@ namespace ams {
             .sb_efficiency = 4,
 
             .num_bsd_sessions = 3,
+            /* bsd:u. The relay socket reaches the internet by registering its
+               fd with an nifm request (see relay_client.cpp), not by service
+               type. (A bsd:s experiment for SOCK_RAW was tried and dropped:
+               raw egress never loops back locally on this stack, so the
+               receive path serves peer frames through the bsd:u RecvFrom
+               intercept instead - no raw socket needed.) */
             .bsd_service_type = BsdServiceType_User,
         };
 
@@ -271,6 +278,10 @@ namespace ams {
         constexpr sm::ServiceName BsdMitmServiceName = sm::ServiceName::Encode("bsd:u");
         R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::BsdMitmService>(mitm::PortIndex_Bsd, BsdMitmServiceName)));
         LogFormat("registered");
+
+        /* Load the internet-relay config (docs/internet-relay-plan.md). Relay
+           mode is off unless sdmc:/ldn_mitm_relay.cfg names a relay server. */
+        mitm::ldn::relay::LoadConfig();
 
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,

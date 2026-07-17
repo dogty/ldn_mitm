@@ -11,6 +11,7 @@
 #include <cstring>
 #include "ldn_types.hpp"
 #include "lan_protocol.hpp"
+#include "relay_client.hpp"
 
 namespace ams::mitm::ldn {
     const size_t StackSize = 0x4000;
@@ -117,6 +118,35 @@ namespace ams::mitm::ldn {
             void onClose() override;
     };
 
+    /* Phase 1b step 2: LDN discovery over the internet relay. A UdpLanSocket
+       whose byte transport is a RelayTransport instead of a local UDP socket,
+       so the existing LANPacket framing (LanSocket sendPacket/recvPacket)
+       carries Scan/ScanResp over the relay unchanged. onRead dispatches like
+       LDUdpSocket, sharing the udp socket's scanResults so the game sees
+       remote networks in the same list. */
+    class RelayLanSocket : public UdpLanSocketBase, public Pollable {
+        protected:
+            relay::RelayTransport transport;
+            LANDiscovery *discovery;
+            virtual u32 getBroadcast() override { return 0x0A0DFFFFu; } /* 10.13.255.255 */
+            virtual ssize_t recvfrom(void *buf, size_t len, struct sockaddr_in *addr) override;
+            virtual int sendto(const void *buf, size_t len, struct sockaddr_in *addr) override;
+        public:
+            RelayLanSocket(LANDiscovery *discovery) : UdpLanSocketBase(-1, 11452), discovery(discovery) {}
+            Result open() { return this->transport.Open(); }
+            bool isReady() const { return this->transport.IsOpen(); }
+            int getFd() override { return this->transport.GetFd(); }
+            int onRead() override;
+            void onClose() override {}
+            void keepalive() { this->transport.SendKeepalive(); }
+            /* Broadcast a LANPacket (Connect/SyncNetwork) over the relay.
+               Relay sends are always broadcasts (sendto ignores the addr), so
+               this reaches every other console on the relay. */
+            int send(LANPacketType type, const void *data, size_t size) {
+                return this->sendPacket(type, data, size);
+            }
+    };
+
     class LANDiscovery {
         public:
             static const int DefaultPort = 11452;
@@ -129,6 +159,7 @@ namespace ams::mitm::ldn {
             friend class LDUdpSocket;
             friend class LDTcpSocket;
             friend class LanStation;
+            friend class RelayLanSocket;
             // 0: udp 1: tcp 2: client
             os::Mutex pollMutex;
             // Guards data shared between the worker thread and IPC threads:
@@ -138,6 +169,9 @@ namespace ams::mitm::ldn {
             os::Mutex dataMutex;
             std::unique_ptr<LDUdpSocket> udp;
             std::unique_ptr<LDTcpSocket> tcp;
+            /* Phase 1b: present only in relay mode (relay::IsEnabled()). */
+            std::unique_ptr<RelayLanSocket> relay;
+            u64 relayKeepaliveMs = 0;
             std::array<LanStation, StationCountMax> stations;
             std::array<NodeLatestUpdate, NodeCountMax> nodeChanges;
             std::array<u8, NodeCountMax> nodeLastStates;
@@ -154,6 +188,9 @@ namespace ams::mitm::ldn {
             int loopPoll();
             void onSyncNetwork(NetworkInfo *info);
             void onConnect(int new_fd);
+            /* Relay mode: a station joined by sending Connect over the relay
+               (no per-station TCP socket). */
+            void onRelayConnect(const NodeInfo *info);
             void onDisconnectFromHost();
             void onNetworkInfoChanged();
 
