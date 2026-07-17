@@ -25,6 +25,8 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
+#include <sys/time.h>
 #include <atomic>
 #include <mutex>
 #include <cstdio>
@@ -51,8 +53,11 @@ namespace ams::mitm::ldn::relay {
             return static_cast<u16>(~s & 0xffff);
         }
 
-        /* Relay server list, parsed from RelayConfigPath by LoadConfig(). */
-        struct Server { char name[ServerNameLen]; u32 ip; u16 port; };
+        /* Relay server list, parsed from RelayConfigPath by LoadConfig().
+           host holds the raw address token (an IPv4 literal or a hostname);
+           ip is the parsed literal in host order, or 0 for a hostname that
+           must be resolved at connect time. */
+        struct Server { char name[ServerNameLen]; char host[64]; u32 ip; u16 port; };
         Server g_servers[MaxServers];
         int g_count = 0;
         /* Runtime state, driven by the Tesla overlay. Relay is OFF by default
@@ -105,15 +110,30 @@ namespace ams::mitm::ldn::relay {
                 }
                 std::strncpy(name, addr, sizeof(name) - 1);
             }
-            unsigned a = 0, b = 0, c = 0, d = 0, port = 11451;
-            if (std::sscanf(addr, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) < 4 ||
-                a > 255 || b > 255 || c > 255 || d > 255 || port == 0 || port > 65535) {
+
+            /* addr = "host[:port]"; host is an IPv4 literal or a hostname. */
+            unsigned port = 11451;
+            char *colon = std::strchr(addr, ':');
+            if (colon != nullptr) {
+                *colon = '\0';
+                port = static_cast<unsigned>(std::atoi(colon + 1));
+            }
+            if (addr[0] == '\0' || port == 0 || port > 65535) {
                 continue;
             }
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            u32 ip = 0;
+            if (std::sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+                a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+                ip = (a << 24) | (b << 16) | (c << 8) | d;   /* literal IPv4 */
+            }
+
             Server &s = g_servers[g_count];
             std::strncpy(s.name, name, sizeof(s.name) - 1);
             s.name[sizeof(s.name) - 1] = '\0';
-            s.ip   = (a << 24) | (b << 16) | (c << 8) | d;
+            std::strncpy(s.host, addr, sizeof(s.host) - 1);
+            s.host[sizeof(s.host) - 1] = '\0';
+            s.ip   = ip;
             s.port = static_cast<u16>(port);
             g_count++;
         }
@@ -131,9 +151,16 @@ namespace ams::mitm::ldn::relay {
     int  SelectedServer()     { return g_selected.load(); }
     void SelectServer(int i)  { if (i >= 0 && i < g_count) { g_selected = i; } }
 
+    /* Selected server's literal IPv4 (host order), or 0 if it is a hostname
+       (resolved by RelayTransport at connect time). */
     u32  ServerIp() {
         const int i = g_selected.load();
         return (i >= 0 && i < g_count) ? g_servers[i].ip : 0;
+    }
+    /* Selected server's raw address token (IP literal or hostname). */
+    const char *ServerHost() {
+        const int i = g_selected.load();
+        return (i >= 0 && i < g_count) ? g_servers[i].host : "";
     }
     u16  ServerPort() {
         const int i = g_selected.load();
@@ -171,6 +198,107 @@ namespace ams::mitm::ldn::relay {
     }
 
     /* ---- RelayTransport (Phase 1b step 2): reusable relay socket ---- */
+
+    u32 RelayTransport::ResolveHostname(const char *host) {
+        /* Minimal DNS A-record lookup, built by hand and sent over an
+           nifm-registered socket (libnx getaddrinfo aborts in this sysmodule).
+           Returns the first A record (host order), or 0 on any failure. */
+        if (host == nullptr || host[0] == '\0') {
+            return 0;
+        }
+        u32 a = 0, mask = 0, gw = 0, dns1 = 0, dns2 = 0;
+        nifmGetCurrentIpConfigInfo(&a, &mask, &gw, &dns1, &dns2);
+
+        struct sockaddr_in srv = {};
+        srv.sin_family = AF_INET;
+        srv.sin_port = htons(53);
+        srv.sin_addr.s_addr = (dns1 != 0) ? dns1 : htonl(0x08080808u); /* fall back to 8.8.8.8 */
+
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            return 0;
+        }
+        if (m_have_req) {
+            nifmRequestRegisterSocketDescriptor(&m_req, fd);
+        }
+        struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        auto cleanup = [&]() {
+            if (m_have_req) { nifmRequestUnregisterSocketDescriptor(&m_req, fd); }
+            close(fd);
+        };
+
+        /* Build the query. */
+        u8 q[300];
+        size_t p = 0;
+        q[p++] = 0x13; q[p++] = 0x37;               /* id */
+        q[p++] = 0x01; q[p++] = 0x00;               /* flags: standard query, RD */
+        q[p++] = 0x00; q[p++] = 0x01;               /* qdcount 1 */
+        q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0; /* an/ns/ar */
+        const char *s = host;
+        while (*s != '\0') {
+            const char *dot = std::strchr(s, '.');
+            const size_t len = dot ? static_cast<size_t>(dot - s) : std::strlen(s);
+            if (len == 0 || len > 63 || p + len + 6 >= sizeof(q)) {
+                cleanup();
+                return 0;
+            }
+            q[p++] = static_cast<u8>(len);
+            std::memcpy(q + p, s, len);
+            p += len;
+            s += len;
+            if (*s == '.') { s++; }
+        }
+        q[p++] = 0x00;                              /* root label */
+        q[p++] = 0x00; q[p++] = 0x01;              /* qtype A */
+        q[p++] = 0x00; q[p++] = 0x01;              /* qclass IN */
+
+        if (::sendto(fd, q, p, 0, reinterpret_cast<struct sockaddr *>(&srv), sizeof(srv)) < 0) {
+            cleanup();
+            return 0;
+        }
+
+        u8 r[512];
+        const ssize_t n = ::recvfrom(fd, r, sizeof(r), 0, nullptr, nullptr);
+        cleanup();
+        if (n < 12) {
+            return 0;
+        }
+        const int ancount = (r[6] << 8) | r[7];
+        if (ancount < 1) {
+            return 0;
+        }
+
+        /* Skip the question: walk the qname to its 0 terminator, then qtype +
+           qclass (4 bytes). */
+        size_t off = 12;
+        while (off < static_cast<size_t>(n) && r[off] != 0) {
+            if ((r[off] & 0xc0) == 0xc0) { off += 1; break; } /* compression ptr */
+            off += r[off] + 1;
+        }
+        off += 1 + 4;
+
+        for (int i = 0; i < ancount && off + 12 <= static_cast<size_t>(n); i++) {
+            if ((r[off] & 0xc0) == 0xc0) {
+                off += 2;
+            } else {
+                while (off < static_cast<size_t>(n) && r[off] != 0) { off += r[off] + 1; }
+                off += 1;
+            }
+            if (off + 10 > static_cast<size_t>(n)) {
+                break;
+            }
+            const int type  = (r[off] << 8) | r[off + 1];
+            const int rdlen = (r[off + 8] << 8) | r[off + 9];
+            off += 10;
+            if (type == 1 && rdlen == 4 && off + 4 <= static_cast<size_t>(n)) {
+                return (r[off] << 24) | (r[off + 1] << 16) | (r[off + 2] << 8) | r[off + 3];
+            }
+            off += rdlen;
+        }
+        return 0;
+    }
 
     Result RelayTransport::Open() {
         /* Internet route (proven chain): nifm session + request + register the
@@ -219,6 +347,20 @@ namespace ams::mitm::ldn::relay {
             m_vsrc = (10u << 24) | (13u << 16) | 0x0001;
         }
 
+        /* Resolve the server: a literal IP is used directly; a hostname is
+           resolved by our own tiny DNS client (libnx's getaddrinfo aborts in
+           this sysmodule - its resolver allocates through a path AMS does not
+           support). 0 = bad/unresolvable -> fail and fall back to local LDN. */
+        u32 server_ip = ServerIp();
+        if (server_ip == 0) {
+            server_ip = this->ResolveHostname(ServerHost());
+        }
+        if (server_ip == 0) {
+            LogFormat("relay xport: no/unresolvable server address ('%s')", ServerHost());
+            this->Close();
+            return MAKERESULT(0xFD, 102);
+        }
+
         const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) {
             LogFormat("relay xport: socket %d", errno);
@@ -229,7 +371,7 @@ namespace ams::mitm::ldn::relay {
         struct sockaddr_in srv = {};
         srv.sin_family = AF_INET;
         srv.sin_port = htons(ServerPort());
-        srv.sin_addr.s_addr = htonl(ServerIp());
+        srv.sin_addr.s_addr = htonl(server_ip);
 
         nifmRequestRegisterSocketDescriptor(&m_req, fd);
 

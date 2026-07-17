@@ -34,10 +34,11 @@ namespace ams::mitm::ldn {
 
         /* Config file listing relay servers, one per line:
              MyServer 82.65.234.243:11455
-             other    1.2.3.4                (default port 11451)
-           IPv4 only (no hostname); '#' and blank lines ignored. The list only
-           feeds the picker - relay stays OFF (normal local LDN) until the user
-           enables it and chooses a server in the Tesla overlay. */
+             public   relay.example.com     (hostname, default port 11451)
+           Address may be an IPv4 literal or a hostname (resolved via DNS at
+           connect time); '#' and blank lines ignored. The list only feeds the
+           picker - relay stays OFF (normal local LDN) until the user enables
+           it and chooses a server in the Tesla overlay. */
         constexpr const char RelayConfigPath[] = "sdmc:/config/ldn_mitm/relay.cfg";
         constexpr int MaxServers    = 8;
         constexpr int ServerNameLen = 32;
@@ -62,8 +63,11 @@ namespace ams::mitm::ldn {
         int  SelectedServer();
         void SelectServer(int index);
 
-        /* Selected relay server, host byte order. Valid when IsEnabled(). */
+        /* Selected relay server. ServerIp is the literal IPv4 (host order) or
+           0 for a hostname; ServerHost is the raw address token (RelayTransport
+           resolves a hostname at connect time). Valid when IsEnabled(). */
         u32 ServerIp();
+        const char *ServerHost();
         u16 ServerPort();
 
         /* Thread-safe entry for the bsd:u mitm (its IPC threads, not the
@@ -126,6 +130,10 @@ namespace ams::mitm::ldn {
                 int SendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip);
 
             private:
+                /* Resolve a hostname to an IPv4 (host order) with a hand-built
+                   DNS query over an nifm-registered socket. 0 on failure. */
+                u32 ResolveHostname(const char *host);
+
                 /* Queue one relay-received peer game frame for the game to
                    receive via the bsd:u mitm's RecvFrom (with the peer's real
                    source address - the stack cannot deliver a spoofed source
