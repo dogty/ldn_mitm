@@ -1,0 +1,14 @@
+# ldn_mitm internet-relay servers.
+# Copy this to  sdmc:/config/ldn_mitm/relay.cfg  on your SD card.
+#
+# One server per line:   <name>  <A.B.C.D[:PORT]>
+#   - name is a label shown in the Tesla overlay picker
+#   - IPv4 address only (no hostnames); default port is 11451 (lan-play default)
+#   - lines starting with '#' and blank lines are ignored
+#   - up to 8 servers
+#
+# Listing servers here does NOT turn the relay on. Open the Tesla overlay,
+# toggle "Internet relay" on, and pick a server. Relay off = normal local LDN.
+
+my-pc        82.65.234.243:11455
+lan-play     104.238.152.86
