@@ -149,6 +149,13 @@ namespace ams::mitm::ldn {
                         break;
                     }
                     std::scoped_lock lock(this->discovery->dataMutex);
+                    /* The host beacons its advertisement every 5s; while we
+                       are joining/joined to that network it doubles as the
+                       host-liveness signal for peer-loss detection. */
+                    if (this->discovery->joinActive &&
+                        info->common.bssid == this->discovery->joinBssid) {
+                        this->discovery->hostLastSeen = os::GetSystemTick();
+                    }
                     if (this->discovery->udp) {
                         if (this->discovery->udp->selfIp != 0 &&
                             info->ldn.nodes[0].ipv4Address == this->discovery->udp->selfIp) {
@@ -183,6 +190,30 @@ namespace ams::mitm::ldn {
                         this->discovery->getState() == CommState::StationConnected) {
                         LogFormat("relay: got SyncNetwork");
                         this->discovery->onSyncNetwork(info);
+                    }
+                    break;
+                }
+                case LANPacketType::RelayHeartbeat: {
+                    /* Host side: a connected relay station signalling it is
+                       still alive (it has no TCP socket whose close would
+                       report the opposite). Scoped to our session's bssid so
+                       a shared relay's foreign heartbeats - or an IP collision
+                       across NATs - can never refresh our stations. */
+                    const RelayHeartbeatPayload *hb = (decltype(hb))data;
+                    if (size != sizeof(*hb)) {
+                        break;
+                    }
+                    if (this->discovery->getState() == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->discovery->dataMutex);
+                        if (hb->bssid == this->discovery->networkInfo.common.bssid) {
+                            for (auto &st : this->discovery->stations) {
+                                if (st.getStatus() == NodeStatus::Connected &&
+                                    st.getFd() < 0 &&
+                                    st.nodeInfo->ipv4Address == hb->ipv4) {
+                                    st.lastSeen = os::GetSystemTick();
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -265,6 +296,8 @@ namespace ams::mitm::ldn {
             LogFormat("onSyncNetwork: not for our target network, ignoring");
             return;
         }
+        /* Host-originated traffic for our network counts as host liveness. */
+        this->hostLastSeen = os::GetSystemTick();
         this->networkInfo = *info;
         if (this->state == CommState::Station) {
             this->setState(CommState::StationConnected);
@@ -315,6 +348,7 @@ namespace ams::mitm::ldn {
             if (st.getStatus() != NodeStatus::Disconnected &&
                 st.nodeInfo->ipv4Address == info->ipv4Address) {
                 LogFormat("relay: duplicate Connect from %08x, re-syncing", info->ipv4Address);
+                st.lastSeen = os::GetSystemTick();
                 this->updateNodes();
                 return;
             }
@@ -328,6 +362,7 @@ namespace ams::mitm::ldn {
             if (st.getStatus() == NodeStatus::Disconnected) {
                 *st.nodeInfo = *info;             /* into networkInfo.ldn.nodes[nodeId] */
                 st.status = NodeStatus::Connected;
+                st.lastSeen = os::GetSystemTick();
                 LogFormat("relay: station %d connected (%08x)", st.nodeId, info->ipv4Address);
                 this->updateNodes();              /* recount + broadcast SyncNetwork */
                 return;
@@ -339,6 +374,11 @@ namespace ams::mitm::ldn {
     void LANDiscovery::onDisconnectFromHost() {
         LogFormat("onDisconnectFromHost state: %d", static_cast<int>(this->state));
         if (this->state == CommState::StationConnected) {
+            {
+                /* Stop heartbeating / staleness-checking a session we left. */
+                std::scoped_lock lock(this->dataMutex);
+                this->relayJoined = false;
+            }
             /* Real ldn reports why the station left the network; without
                this the game polls GetDisconnectReason, sees None and may
                wait forever instead of showing its error UI. */
@@ -779,8 +819,59 @@ namespace ams::mitm::ldn {
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
                         this->relay->send(LANPacketType::ScanResp, &this->networkInfo, sizeof(this->networkInfo));
+                    } else if (this->state == CommState::StationConnected && this->relayJoined) {
+                        /* Connected over the relay: heartbeat so the host can
+                           tell we are alive even while idle (game traffic does
+                           not pass through LANDiscovery). Being an IPv4 frame
+                           with our source address, it also refreshes our
+                           registration at the relay server - no separate
+                           keepalive needed. */
+                        RelayHeartbeatPayload hb = {};
+                        {
+                            std::scoped_lock lock(this->dataMutex);
+                            hb.bssid = this->joinBssid;
+                            hb.ipv4  = this->relayJoinedIp;
+                        }
+                        this->relay->send(LANPacketType::RelayHeartbeat, &hb, sizeof(hb));
                     } else {
                         this->relay->keepalive();
+                    }
+
+                    /* Peer-loss detection (relay only): there is no TCP socket
+                       whose close reports a vanished relay peer, so reap peers
+                       that have been silent longer than RelayPeerTimeoutMs.
+                       Liveness stamps come from the host's 5s beacon /
+                       SyncNetwork (station side) and from station heartbeats /
+                       Connect retries (host side). Checked on the beacon
+                       cadence - +-5s precision is fine for a 30s timeout. */
+                    if (this->state == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->dataMutex);
+                        bool changed = false;
+                        for (auto &st : this->stations) {
+                            if (st.getStatus() == NodeStatus::Connected && st.getFd() < 0 &&
+                                os::ConvertToTimeSpan(now - st.lastSeen).GetMilliSeconds() >= RelayPeerTimeoutMs) {
+                                LogFormat("relay: station %d (%08x) silent > %ds, dropping",
+                                    st.nodeId, st.nodeInfo->ipv4Address,
+                                    static_cast<int>(RelayPeerTimeoutMs / 1000));
+                                st.reset();
+                                changed = true;
+                            }
+                        }
+                        if (changed) {
+                            this->updateNodes();  /* recount + SyncNetwork to survivors */
+                        }
+                    } else if (this->state == CommState::StationConnected) {
+                        bool host_lost = false;
+                        {
+                            std::scoped_lock lock(this->dataMutex);
+                            host_lost = this->relayJoined &&
+                                os::ConvertToTimeSpan(now - this->hostLastSeen).GetMilliSeconds() >= RelayPeerTimeoutMs;
+                        }
+                        if (host_lost) {
+                            LogFormat("relay: host silent > %ds, disconnecting",
+                                static_cast<int>(RelayPeerTimeoutMs / 1000));
+                            this->onDisconnectFromHost();  /* SignalLost -> game error UI */
+                        }
                     }
                 }
             }
@@ -945,6 +1036,7 @@ namespace ams::mitm::ldn {
             /* No longer joined: stop accepting sync for the old network. */
             std::scoped_lock lock(this->dataMutex);
             this->joinActive = false;
+            this->relayJoined = false;
         }
         this->setState(CommState::Station);
 
@@ -1006,6 +1098,7 @@ namespace ams::mitm::ldn {
             /* Browsing again, not joining any network yet: reject stray sync. */
             std::scoped_lock lock(this->dataMutex);
             this->joinActive = false;
+            this->relayJoined = false;
         }
 
         this->setState(CommState::Station);
@@ -1084,6 +1177,14 @@ namespace ams::mitm::ldn {
             for (int j = 0; j < 300; j++) {
                 if (this->state == CommState::StationConnected) {
                     LogFormat("relay connect: joined");
+                    {
+                        /* Arm relay peer-loss detection: heartbeats out every
+                           beacon interval, host silence reaped by the worker. */
+                        std::scoped_lock lock(this->dataMutex);
+                        this->relayJoined   = true;
+                        this->relayJoinedIp = myNode.ipv4Address;
+                        this->hostLastSeen  = os::GetSystemTick();
+                    }
                     return 0;
                 }
                 svcSleepThread(10000000L); /* 10ms */

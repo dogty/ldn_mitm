@@ -32,14 +32,30 @@ namespace ams::mitm::ldn {
 
     class LANDiscovery;
 
+    /* Payload of LANPacketType::RelayHeartbeat. The bssid scopes the
+       heartbeat to one session (a shared relay carries other sessions'
+       broadcasts too, and private IPs can collide across NATs); ipv4 is the
+       sender's address in host byte order, matching NodeInfo::ipv4Address. */
+    struct RelayHeartbeatPayload {
+        MacAddress bssid;
+        u8 _pad[2];
+        u32 ipv4;
+    };
+
     class LanStation : public Pollable {
         protected:
             friend class LANDiscovery;
+            /* Heartbeat receive path stamps lastSeen and matches nodeInfo. */
+            friend class RelayLanSocket;
             NodeInfo *nodeInfo;
             NodeStatus status;
             std::unique_ptr<TcpLanSocketBase> socket;
             int nodeId;
             LANDiscovery *discovery;
+        public:
+            /* Relay stations only (no TCP socket): last time the host heard
+               anything from this station. Guarded by discovery->dataMutex. */
+            os::Tick lastSeen = os::Tick(0);
         public:
             LanStation(int nodeId, LANDiscovery *discovery)
                 : nodeInfo(nullptr),
@@ -154,6 +170,14 @@ namespace ams::mitm::ldn {
                server. Must stay well under the server's idle timeout (60s) so
                an idle host is never forgotten. */
             static constexpr s64 RelayBeaconIntervalMs = 5000;
+            /* How long (ms) a relay peer may stay silent before it is presumed
+               gone (host: reap the station's node slot; station: report
+               SignalLost so the game shows its error UI instead of hanging).
+               Liveness arrives every RelayBeaconIntervalMs (host beacon /
+               station heartbeat), so this is 6 missed beats. TUNABLE: raise if
+               healthy sessions on jittery internet paths get torn down, lower
+               for faster peer-loss detection. */
+            static constexpr s64 RelayPeerTimeoutMs = 30000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
@@ -193,6 +217,14 @@ namespace ams::mitm::ldn {
                Guarded by dataMutex. */
             MacAddress joinBssid{};
             bool joinActive = false;
+            /* Station side, relay joins only: last time anything host-originated
+               arrived (beacon ScanResp / SyncNetwork), whether this session was
+               joined over the relay (TCP joins detect peer loss via socket
+               close instead), and our own IP as advertised in Connect (echoed
+               in heartbeats). Guarded by dataMutex. */
+            os::Tick hostLastSeen = os::Tick(0);
+            bool relayJoined = false;
+            u32 relayJoinedIp = 0;
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;

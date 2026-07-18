@@ -7,6 +7,10 @@ enum class LANPacketType : u8 {
     ScanResp,
     Connect,
     SyncNetwork,
+    /* Relay mode only: periodic liveness signal from a connected station,
+       broadcast over the relay so its host can detect a vanished peer (no
+       TCP close exists there). Builds without it ignore unknown types. */
+    RelayHeartbeat,
 };
 
 typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
