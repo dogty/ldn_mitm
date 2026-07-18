@@ -134,12 +134,9 @@ namespace ams::mitm::ldn {
             void onClose() override;
     };
 
-    /* Phase 1b step 2: LDN discovery over the internet relay. A UdpLanSocket
-       whose byte transport is a RelayTransport instead of a local UDP socket,
-       so the existing LANPacket framing (LanSocket sendPacket/recvPacket)
-       carries Scan/ScanResp over the relay unchanged. onRead dispatches like
-       LDUdpSocket, sharing the udp socket's scanResults so the game sees
-       remote networks in the same list. */
+    /* LDN discovery over the internet relay: a UdpLanSocket whose transport is
+       a RelayTransport, so LANPacket framing carries Scan/ScanResp unchanged.
+       Shares the udp socket's scanResults. */
     class RelayLanSocket : public UdpLanSocketBase, public Pollable {
         protected:
             relay::RelayTransport transport;
@@ -150,19 +147,14 @@ namespace ams::mitm::ldn {
         public:
             RelayLanSocket(LANDiscovery *discovery) : UdpLanSocketBase(-1, 11452), discovery(discovery) {}
             Result open() { return this->transport.Open(); }
-            bool isReady() const { return this->transport.IsOpen(); }
             int getFd() override { return this->transport.GetFd(); }
             int onRead() override;
-            /* Close the transport so a HUP'd relay socket (sleep/wake, wifi
-               loss) leaves the poll set instead of spinning the worker; the
-               fd goes to -1 and later sends fail harmlessly. Also marks the
-               session for rebuild (defined in the .cpp - LANDiscovery is
-               incomplete here). */
+            /* Close the transport so a HUP'd relay socket leaves the poll set;
+               also marks the session for rebuild (defined in the .cpp). */
             void onClose() override;
             void keepalive() { this->transport.SendKeepalive(); }
-            /* Broadcast a LANPacket (Connect/SyncNetwork) over the relay.
-               Relay sends are always broadcasts (sendto ignores the addr), so
-               this reaches every other console on the relay. */
+            /* Broadcast a LANPacket over the relay (sendto ignores the addr,
+               so it reaches every other console). */
             int send(LANPacketType type, const void *data, size_t size) {
                 return this->sendPacket(type, data, size);
             }
@@ -175,19 +167,12 @@ namespace ams::mitm::ldn {
                server. Must stay well under the server's idle timeout (60s) so
                an idle host is never forgotten. */
             static constexpr s64 RelayBeaconIntervalMs = 5000;
-            /* How long (ms) a relay peer may stay silent before it is presumed
-               gone (host: reap the station's node slot; station: report
-               SignalLost so the game shows its error UI instead of hanging).
-               Liveness arrives every RelayBeaconIntervalMs (host beacon /
-               station heartbeat), so this is 6 missed beats. TUNABLE: raise if
-               healthy sessions on jittery internet paths get torn down, lower
-               for faster peer-loss detection. */
+            /* Silence for ~6 missed 5s beats = peer presumed gone (host reaps
+               the slot; station reports SignalLost). TUNABLE: raise if jittery
+               paths get torn down. */
             static constexpr s64 RelayPeerTimeoutMs = 30000;
-            /* Minimum gap (ms) between relay advertisements (beacon or reply
-               to a Scan). The 5s beacon already reaches every relay client
-               proactively, so a Scan arriving just after one needs no extra
-               reply - without this, hosts answered every scanner's periodic
-               Scan on top of the beacon, doubling advertisement traffic. */
+            /* Min gap between relay advertisements: the 5s beacon already
+               reaches everyone, so don't also answer every scanner's Scan. */
             static constexpr s64 RelayAdvertiseMinIntervalMs = 2000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
@@ -219,30 +204,25 @@ namespace ams::mitm::ldn {
             bool stop;
             bool initialized;
             NetworkInfo networkInfo;
-            /* Station side: the network this console set out to join. A relay
-               server is shared by unrelated sessions, so SyncNetwork frames
-               from OTHER hosts reach us too; we accept network sync only while
-               joinActive and only when the frame's bssid matches joinBssid.
-               This also stops a still-scanning station (joinActive == false)
-               from being flipped StationConnected by a stray broadcast.
-               Guarded by dataMutex. */
+            /* Station side: target network for the join. Sync is accepted only
+               while joinActive and bssid-matched (a shared relay carries other
+               sessions' SyncNetwork, and a scanning station must not be flipped
+               connected by a stray broadcast). Guarded by dataMutex. */
             MacAddress joinBssid{};
             bool joinActive = false;
-            /* Station side, relay joins only: last time anything host-originated
-               arrived (beacon ScanResp / SyncNetwork), whether this session was
-               joined over the relay (TCP joins detect peer loss via socket
-               close instead), and our own IP as advertised in Connect (echoed
-               in heartbeats). Guarded by dataMutex. */
+            /* Station side, relay joins only: host-liveness timestamp, whether
+               this join went over the relay (TCP joins detect loss via socket
+               close), and our advertised IP (echoed in heartbeats). Guarded by
+               dataMutex. */
             os::Tick hostLastSeen = os::Tick(0);
             bool relayJoined = false;
             u32 relayJoinedIp = 0;
-            /* Host side: when we last advertised over the relay (worker beacon
-               or Scan reply), for the rate limit above. Guarded by dataMutex. */
+            /* Host side: when we last advertised over the relay, for the rate
+               limit. Guarded by dataMutex. */
             os::Tick lastRelayAdvertise = os::Tick(0);
             /* What initialize() latched, so openAccessPoint/openStation can
-               detect that the overlay toggle changed since (or that the
-               session was torn down at sleep) and rebuild it in the right
-               mode (see refreshNetworkSession). */
+               detect a toggle change or sleep teardown and rebuild (see
+               refreshNetworkSession). */
             bool initRelay = false;
             bool initListening = true;
             bool needsReinit = false;

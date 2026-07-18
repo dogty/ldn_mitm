@@ -102,19 +102,13 @@ namespace ams::mitm::ldn {
     }
 
     void LDUdpSocket::onClose() {
-        /* Take the dead socket out of the poll set (same rationale as
-           LDTcpSocket::onClose): after a sleep/wake or wifi loss every socket
-           reports POLLHUP forever, and leaving the fd in the set spins the
-           worker in Poll->onClose at full speed until the game finalizes.
-           The discovery udp socket only dies with its interface (airplane
-           mode, wifi loss), so mark the session for a rebuild: once the
-           network is back and the game re-enters its host/join menu,
-           refreshNetworkSession() re-creates everything - no game relaunch.
-           Reason: interface death is a SYSTEM-initiated end from the game's
-           point of view - pia classifies airplane mode (2618-0313) right
-           next to sleep (2618-0314), and reporting SignalLost here instead
-           sent AC into its generic-failure cascade (2123-0011...). Keep
-           SignalLost for actual peer loss (TCP close / relay timeout). */
+        /* A dead fd left in the poll set spins the worker in Poll->onClose;
+           close it and mark the session for rebuild on the next host/join. The
+           discovery udp socket only dies with its interface (airplane mode,
+           wifi loss) - a SYSTEM-initiated end, so report Destroyed/
+           DisconnectedBySystem, never SignalLost (that breaks games' error
+           handling; pia classifies airplane 2618-0313 next to sleep 2618-0314).
+           SignalLost stays for real peer loss (TCP close / relay timeout). */
         this->close();
         discovery->needsReinit = true;
         /* Keep the FIRST recorded cause: if the session already ended (sleep
@@ -233,11 +227,9 @@ namespace ams::mitm::ldn {
                     break;
                 }
                 case LANPacketType::RelayHeartbeat: {
-                    /* Host side: a connected relay station signalling it is
-                       still alive (it has no TCP socket whose close would
-                       report the opposite). Scoped to our session's bssid so
-                       a shared relay's foreign heartbeats - or an IP collision
-                       across NATs - can never refresh our stations. */
+                    /* A relay station signalling it is alive (no TCP socket to
+                       report otherwise). Scoped to our bssid so a shared relay's
+                       foreign heartbeats can't refresh us. */
                     const RelayHeartbeatPayload *hb = (decltype(hb))data;
                     if (size != sizeof(*hb)) {
                         break;
@@ -304,9 +296,8 @@ namespace ams::mitm::ldn {
 
     void LDTcpSocket::onClose() {
         LogFormat("LDTcpSocket::onClose");
-        /* Take the dead socket out of the poll set. Without this the fd
-           stays readable at EOF and the worker re-enters onRead/onClose in
-           a tight loop until the game finalizes. */
+        /* Drop the dead socket from the poll set, else EOF keeps it readable
+           and the worker loops onRead/onClose until the game finalizes. */
         this->close();
         this->discovery->onDisconnectFromHost();
     }
@@ -326,11 +317,9 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::onSyncNetwork(NetworkInfo *info) {
         std::scoped_lock lock(this->dataMutex);
-        /* Accept network sync only for the network we are joining/joined. A
-           merely-scanning station (openStation, no connect yet) has
-           joinActive == false and is never flipped connected, and on a shared
-           relay another session's SyncNetwork (a different bssid) can never
-           overwrite our state. */
+        /* Accept sync only for the network we're joining (joinActive + bssid
+           match): a shared relay carries other sessions' SyncNetwork, and a
+           scanning station must not be flipped connected by a stray broadcast. */
         if (!this->joinActive || !(info->common.bssid == this->joinBssid)) {
             LogFormat("onSyncNetwork: not for our target network, ignoring");
             return;
@@ -831,11 +820,9 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::worker() {
         this->stop = false;
-        /* loopPoll() blocks up to the poll timeout (100ms default), so loop
-           iterations are ~100ms, not 1ms - a per-iteration counter would fire
-           the keepalive ~100x too slowly (every ~8min). Measure real elapsed
-           time instead so registration is refreshed well within the relay
-           server's idle timeout (60s). */
+        /* loopPoll blocks ~100ms per iteration - measure elapsed wall time, not
+           iterations, so the beacon stays well under the relay server's 60s
+           idle timeout. */
         os::Tick last_beacon = os::GetSystemTick();
         while (!this->stop) {
 
@@ -847,25 +834,19 @@ namespace ams::mitm::ldn {
                 const os::Tick now = os::GetSystemTick();
                 if (os::ConvertToTimeSpan(now - last_beacon).GetMilliSeconds() >= RelayBeaconIntervalMs) {
                     last_beacon = now;
-                    /* A host that is merely idling in a lobby (no station has
-                       joined yet) otherwise transmits nothing but the empty
-                       keepalive, which carries no source IP - so the relay
-                       server never learns its endpoint and a remote joiner's
-                       Scan is forwarded to nobody. Re-broadcast our network
-                       advertisement instead: it registers our source at the
-                       server AND lets remote consoles discover us proactively.
+                    /* An idle host would send only the empty keepalive, which
+                       carries no source IP - the relay never learns its
+                       endpoint. Re-broadcast the advertisement instead:
+                       registers us AND lets remote consoles discover us.
                        Non-hosts just refresh their registration. */
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
                         this->lastRelayAdvertise = now;
                         this->relay->send(LANPacketType::ScanResp, &this->networkInfo, sizeof(this->networkInfo));
                     } else if (this->state == CommState::StationConnected && this->relayJoined) {
-                        /* Connected over the relay: heartbeat so the host can
-                           tell we are alive even while idle (game traffic does
-                           not pass through LANDiscovery). Being an IPv4 frame
-                           with our source address, it also refreshes our
-                           registration at the relay server - no separate
-                           keepalive needed. */
+                        /* Heartbeat so the host knows we are alive while idle
+                           (game traffic bypasses LANDiscovery); as an IPv4 frame
+                           it also refreshes our relay registration. */
                         RelayHeartbeatPayload hb = {};
                         {
                             std::scoped_lock lock(this->dataMutex);
@@ -877,13 +858,9 @@ namespace ams::mitm::ldn {
                         this->relay->keepalive();
                     }
 
-                    /* Peer-loss detection (relay only): there is no TCP socket
-                       whose close reports a vanished relay peer, so reap peers
-                       that have been silent longer than RelayPeerTimeoutMs.
-                       Liveness stamps come from the host's 5s beacon /
-                       SyncNetwork (station side) and from station heartbeats /
-                       Connect retries (host side). Checked on the beacon
-                       cadence - +-5s precision is fine for a 30s timeout. */
+                    /* Relay-only peer-loss detection (no TCP close to signal
+                       it): reap peers silent longer than RelayPeerTimeoutMs.
+                       Checked on the beacon cadence. */
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
                         bool changed = false;
@@ -1084,14 +1061,11 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::refreshNetworkSession() {
-        /* The relay decision is latched at initialize(): it selects the nifm
-           request mode (plain internet vs LocalNetworkMode) AND whether the
-           relay transport opens, so a live toggle cannot simply open a
-           socket later. The game only reaches openAccessPoint/openStation
-           from its host/join menus - never mid-session - so if the overlay
-           toggle changed since the latch (or the session was gutted by a
-           sleep/wake, via the HUP closes), rebuild the whole network session in
-           the right mode. Users don't need to relaunch the game. */
+        /* The relay decision is latched at initialize() (nifm mode + whether
+           the transport opens). openAccessPoint/openStation are only reached
+           from host/join menus, never mid-session, so if the toggle changed
+           since the latch - or a sleep/wake gutted the session (needsReinit) -
+           rebuild the whole session in the right mode (no game relaunch). */
         const bool relay_changed = this->initRelay != relay::IsEnabled();
         if (!this->initialized || (!relay_changed && !this->needsReinit)) {
             return 0;
@@ -1195,10 +1169,9 @@ namespace ams::mitm::ldn {
 
         u32 hostIp = networkInfo->ldn.nodes[0].ipv4Address;
 
-        /* Refuse to connect to ourselves. This happens when the relay echoes
-           our own advertisement back, or when two consoles are (mis)configured
-           with the same IP — the TCP connect would target our own address and
-           fail, and the game would retry in a tight loop. */
+        /* Refuse to connect to ourselves (relay echo, or two consoles sharing
+           an IP): the connect would target our own address and the game would
+           retry in a loop. */
         u32 myIp;
         if (R_SUCCEEDED(nifmGetCurrentIpAddress(&myIp))) {
             myIp = ntohl(myIp);
@@ -1208,22 +1181,19 @@ namespace ams::mitm::ldn {
             }
         }
 
-        /* Record the target network so onSyncNetwork only accepts sync for it
-           (a shared relay carries other sessions' SyncNetwork to us too). Must
-           be set before Connect goes out so a fast reply is not rejected. */
+        /* Record the target network before Connect goes out, so onSyncNetwork
+           accepts a fast reply and rejects other sessions' sync on a shared
+           relay. */
         {
             std::scoped_lock lock(this->dataMutex);
             this->joinBssid = networkInfo->common.bssid;
             this->joinActive = true;
         }
 
-        /* Relay mode: the host's IP is a real address on another network,
-           unroutable directly across the internet, so there is no TCP to it.
-           Send Connect over the relay and wait for the host's SyncNetwork
-           (broadcast back over the relay) to mark us StationConnected. Real
-           IPs are advertised throughout — the relay routes control frames as
-           broadcasts, so no virtual addressing is needed here, and NodeInfo
-           stays consistent with the game's own GetIpv4Address. */
+        /* Relay mode: the host's IP is unroutable directly across the internet,
+           so send Connect over the relay and wait for its SyncNetwork. Real IPs
+           are advertised throughout, so NodeInfo stays consistent with the
+           game's GetIpv4Address. */
         if (this->relay) {
             NodeInfo myNode = {0};
             Result rc = this->getNodeInfo(&myNode, userConfig, localCommunicationVersion);
@@ -1252,12 +1222,9 @@ namespace ams::mitm::ldn {
                 }
                 svcSleepThread(10000000L); /* 10ms */
             }
-            /* No SyncNetwork over the relay. The host may be a local console
-               that is not on the relay (relay off there, or its relay open
-               failed), so fall through to a direct TCP join: on the same LAN
-               hostIp still reaches the host's TCP listener. If the host really
-               is remote, the TCP connect below times out and we fail as
-               before, just a few seconds later. */
+            /* No SyncNetwork over the relay: the host may be a local console
+               not on the relay - fall through to a direct TCP join (same-LAN
+               hostIp still reaches it; a remote host just times out below). */
             LogFormat("relay connect: no SyncNetwork, falling back to direct TCP to %08x", hostIp);
         }
 
@@ -1406,10 +1373,9 @@ namespace ams::mitm::ldn {
             {
                 LogFormat("final nifmRequestCancel failed: %x", rc);
             }
-            /* Close frees the IRequest session and the two Event handles the
-               request holds. Cancel alone leaks them, so rapid init/finalize
-               cycling exhausts nifm sessions (2110-0350) and the process
-               handle table, ending in a fatal crash. */
+            /* Close frees the IRequest session and its two Event handles;
+               Cancel alone leaks them, exhausting nifm sessions (2110-0350) on
+               rapid init/finalize. */
             nifmRequestClose(&request);
 
             NifmNetworkProfileData networkProfile;
@@ -1459,27 +1425,16 @@ namespace ams::mitm::ldn {
         }
 
         originalMtu = networkProfile.ip_setting_data.mtu;
-        /* Respect the MTU configured in system settings instead of always
-           forcing 1500. Over a lan-play relay the large LDN packets (Connect
-           and SyncNetwork are ~1152B) plus the relay's UDP encapsulation
-           exceed the internet path MTU and get dropped, which surfaces as the
-           game's session layer failing (e.g. 2618-0006). Lowering the MTU in
-           settings now actually takes effect. We still force 1500 only when
-           the profile reports an unusable value. */
-        /* Games can REQUIRE a large MTU: SF 30th AC's session layer (pia)
-           refuses to run when the interface MTU is below its minimum — the
-           host joins fine, then ignores all peer traffic and errors with
-           2618-0006. Lowering the MTU (as lan-play guides recommend) is what
-           breaks these games, so never clamp it down here; respect the
-           profile and only fix unusable values. */
+        /* Respect the profile MTU; only replace unusable values (0 or >1500)
+           with 1500. Never clamp down: some games' session layer (pia) requires
+           a large MTU and fails (2618-0006) when it is lowered. */
         int desiredMtu = originalMtu;
         if (desiredMtu == 0 || desiredMtu > 1500) {
             desiredMtu = 1500;
         }
 
-        /* Only touch the profile if we actually need to change it. This both
-           avoids needless nifm churn and preserves the true original value.
-           mtuChanged tracks whether we must restore it if init fails partway. */
+        /* Only write the profile if the MTU actually changes; mtuChanged gates
+           the restore on failure. */
         bool mtuChanged = false;
         if (desiredMtu != originalMtu) {
             networkProfile.ip_setting_data.mtu = desiredMtu;
@@ -1513,20 +1468,16 @@ namespace ams::mitm::ldn {
             return rc;
         }
 
-        /* Latch the relay decision ONCE for this whole init. relay::IsEnabled()
-           is a live, overlay-toggleable atomic; reading it separately for the
-           nifm mode below and the transport open further down let a mid-init
-           toggle produce an inconsistent session (internet request with no
-           relay, or LocalNetworkMode with a relay socket that can't reach the
-           server). One read keeps them consistent. */
+        /* Latch relay::IsEnabled() ONCE: it is overlay-toggleable, and separate
+           reads for the nifm mode and the transport open could produce an
+           inconsistent session. */
         const bool use_relay = relay::IsEnabled();
         this->initRelay = use_relay;
         this->initListening = listening;
         this->needsReinit = false;
 
-        /* Relay mode keeps the console on the INTERNET (so the relay socket
-           can reach the server), so skip LocalNetworkMode; the submitted
-           request is then a plain internet request. Local mode is only for
+        /* Relay mode stays on the internet (so the relay socket can reach the
+           server), so skip LocalNetworkMode; local mode is only for
            same-network LDN. */
         if (!use_relay) {
             rc = nifmSetLocalNetworkMode(&request, true);
