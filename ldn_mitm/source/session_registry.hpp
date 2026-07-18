@@ -75,6 +75,11 @@ namespace ams::mitm::ldn {
                empty. Copies up to max_len bytes; out_len is the real length. */
             static bool Pop(u32 *src_ip, u16 *sport, u16 *dport, void *out, size_t max_len, size_t *out_len);
 
+            /* Destination port of the oldest queued frame (host order), or 0
+               if the queue is empty. Used to verify a socket's bound port
+               before latching it as the game session fd. */
+            static u16 PeekDport();
+
             static bool HasData();
 
             /* Session torn down: drop everything and forget the fd. */

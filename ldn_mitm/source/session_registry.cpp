@@ -129,6 +129,14 @@ namespace ams::mitm::ldn {
         return g_rx_count > 0;
     }
 
+    u16 GameRx::PeekDport() {
+        std::scoped_lock lk(g_rx_mutex);
+        if (g_rx_count == 0) {
+            return 0;
+        }
+        return g_rx_ring[g_rx_head].dport;
+    }
+
     void GameRx::Clear() {
         std::scoped_lock lk(g_rx_mutex);
         g_rx_count = 0;

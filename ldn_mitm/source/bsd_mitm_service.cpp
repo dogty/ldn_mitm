@@ -55,6 +55,27 @@ namespace ams::mitm::ldn {
             return n <= 8 || (n % 256) == 0;
         }
 
+        /* getsockname (bsd cmd 16) on the forward session: the local port a
+           socket is bound to. Wire layout verified against the local libnx
+           source (bsd.c: _bsdCmdInSockfdOutSockaddr, in = int sockfd, out =
+           { int ret; int errno_; } + socklen_t addrlen, one
+           HipcAutoSelect|Out sockaddr buffer) and its disassembly in the
+           installed libnx.a. Returns false on any failure. */
+        bool GetForwardBoundPort(::Service *fwd, s32 sockfd, u16 *out_port) {
+            struct sockaddr_in sa = {};
+            const struct { s32 sockfd; } in = { sockfd };
+            struct { s32 ret; s32 bsd_errno; u32 addrlen; } out = {};
+            const Result rc = serviceDispatchInOut(fwd, 16, in, out,
+                .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out },
+                .buffers = { { std::addressof(sa), sizeof(sa) } },
+            );
+            if (R_FAILED(rc) || out.ret != 0 || out.addrlen < sizeof(sa)) {
+                return false;
+            }
+            *out_port = ntohs(sa.sin_port);
+            return true;
+        }
+
     }
 
     Result BsdMitmService::Select(sf::Out<s32> ret, sf::Out<s32> bsd_errno, BsdSelectInData in_data, sf::InAutoSelectBuffer rd_in, sf::InAutoSelectBuffer wr_in, sf::InAutoSelectBuffer ex_in, sf::OutAutoSelectBuffer rd_out, sf::OutAutoSelectBuffer wr_out, sf::OutAutoSelectBuffer ex_out) {
@@ -263,10 +284,24 @@ namespace ams::mitm::ldn {
                peer frames are queued is the game waiting on its session socket
                (the joiner never broadcasts first, so SendTo can't record it).
                HasData() is only true during an active relay session, so this
-               cannot mis-fire for unrelated games. */
+               cannot mis-fire for unrelated games.
+               A game can run several UDP sockets (a second pia socket, voice,
+               a discovery port); whichever recv'd FIRST used to get latched,
+               and a wrong latch misrouted relay traffic until teardown. Ask
+               the real bsd which local port this socket is bound to and latch
+               only when it matches the queued frame's destination port; on
+               any mismatch or getsockname failure, forward verbatim - the
+               real session socket will come along and match. */
             if (GameRx::GameFd() < 0) {
-                GameRx::SetGameFd(sockfd);
-                LogFormat("bsd RecvFrom: bootstrapped game fd %d from recv", sockfd);
+                u16 bound_port = 0;
+                if (GetForwardBoundPort(this->m_forward_service.get(), sockfd, std::addressof(bound_port)) &&
+                    bound_port != 0 && bound_port == GameRx::PeekDport()) {
+                    GameRx::SetGameFd(sockfd);
+                    LogFormat("bsd RecvFrom: bootstrapped game fd %d (bound port %u) from recv", sockfd, bound_port);
+                } else {
+                    LogFormat("bsd RecvFrom: fd %d bound port %u != queued dport %u, not latching",
+                        sockfd, bound_port, GameRx::PeekDport());
+                }
             }
 
             if (sockfd != GameRx::GameFd()) {
