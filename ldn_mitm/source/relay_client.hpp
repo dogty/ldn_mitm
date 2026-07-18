@@ -57,6 +57,11 @@ namespace ams::mitm::ldn {
            the server picker - all driven by the Tesla overlay via the config
            IPC service. */
         void SetRelayEnabled(bool on);
+        /* Rewrite relay.cfg's directive lines (enabled/broadcast/selected)
+           from current runtime state; called by the config service when the
+           broadcast-relay toggle changes (the other setters persist
+           themselves). */
+        void PersistSettings();
         bool GetRelayEnabled();
         int  ServerCount();
         const char *ServerName(int index);   /* "" if out of range */

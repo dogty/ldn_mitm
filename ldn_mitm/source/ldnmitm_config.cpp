@@ -35,6 +35,7 @@ namespace ams::mitm::ldn {
     }
     Result LdnConfig::SetBroadcastRelay(u32 enabled) {
         BroadcastRelay = enabled;
+        relay::PersistSettings();
 
         R_SUCCEED();
     }

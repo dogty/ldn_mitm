@@ -18,6 +18,7 @@
 #include "debug.hpp"
 #include "nifm_manager.hpp"
 #include "session_registry.hpp"
+#include "ldnmitm_config.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -75,17 +76,45 @@ namespace ams::mitm::ldn::relay {
         std::atomic_bool g_enabled{false};
     }
 
+    namespace {
+        /* Directive-line parser: "name", "name=value" or "name value".
+           Returns the (possibly empty) value, or nullptr if the line is not
+           this directive. */
+        const char *DirectiveValue(const char *l, const char *name) {
+            const size_t n = std::strlen(name);
+            if (std::strncmp(l, name, n) != 0) {
+                return nullptr;
+            }
+            const char c = l[n];
+            if (c != '\0' && c != '=' && c != ' ' && c != '\t') {
+                return nullptr;
+            }
+            const char *v = l + n;
+            while (*v == '=' || *v == ' ' || *v == '\t') { v++; }
+            return v;
+        }
+
+        bool IsDirectiveLine(const char *l) {
+            return DirectiveValue(l, "enabled")   != nullptr ||
+                   DirectiveValue(l, "broadcast") != nullptr ||
+                   DirectiveValue(l, "selected")  != nullptr;
+        }
+    }
+
     void LoadConfig() {
         /* RelayConfigPath lists relay servers, one per line:
              MyServer 82.65.234.243:11455
              lan-play 1.2.3.4              (default port 11451)
            IPv4 only; lines starting with '#' and blank lines are ignored.
-           An "enabled=1" line turns the relay on at boot; the Tesla overlay
-           toggle rewrites it (SetRelayEnabled), so the choice survives
-           reboots instead of silently resetting to off. */
+           Directive lines persist the Tesla-overlay settings across reboots
+           (rewritten by PersistConfig whenever a toggle changes):
+             enabled=0/1     internet relay on at boot
+             broadcast=0/1   bsd broadcast->unicast relay
+             selected=NAME   which server from the list is active */
         g_count = 0;
         g_selected = 0;
         g_enabled = false;
+        char pending_selected[ServerNameLen] = {};
 
         fs::FileHandle f;
         if (R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
@@ -110,14 +139,21 @@ namespace ams::mitm::ldn::relay {
             if (*line == '#' || *line == '\0') {
                 continue;
             }
-            /* Directive line, not a server: enabled=0/1. Must be matched
-               before server parsing or it would register as a bogus server
-               named "enabled=1". */
-            if (std::strncmp(line, "enabled", 7) == 0 &&
-                (line[7] == '\0' || line[7] == '=' || line[7] == ' ' || line[7] == '\t')) {
-                const char *v = line + 7;
-                while (*v == '=' || *v == ' ' || *v == '\t') { v++; }
+            /* Directive lines, not servers. Must be matched before server
+               parsing or they would register as bogus servers. */
+            if (const char *v = DirectiveValue(line, "enabled")) {
                 g_enabled = (std::atoi(v) != 0);
+                continue;
+            }
+            if (const char *v = DirectiveValue(line, "broadcast")) {
+                LdnConfig::setBroadcastRelay(std::atoi(v) != 0);
+                continue;
+            }
+            if (const char *v = DirectiveValue(line, "selected")) {
+                /* By NAME, so editing/reordering the server list can't
+                   silently switch which relay is active. Resolved after the
+                   list is parsed (the directive may precede the servers). */
+                std::strncpy(pending_selected, v, sizeof(pending_selected) - 1);
                 continue;
             }
             char name[ServerNameLen] = {};
@@ -156,14 +192,28 @@ namespace ams::mitm::ldn::relay {
             s.port = static_cast<u16>(port);
             g_count++;
         }
-        LogFormat("relay: loaded %d server(s)", g_count);
+
+        /* Restore the persisted server selection now that the list exists. */
+        for (char *e = pending_selected + std::strlen(pending_selected);
+             e > pending_selected && (e[-1] == ' ' || e[-1] == '\t'); ) {
+            *--e = '\0';
+        }
+        if (pending_selected[0] != '\0') {
+            for (int i = 0; i < g_count; i++) {
+                if (std::strcmp(g_servers[i].name, pending_selected) == 0) {
+                    g_selected = i;
+                    break;
+                }
+            }
+        }
+        LogFormat("relay: loaded %d server(s), selected %d", g_count, g_selected.load());
     }
 
     namespace {
-        /* Rewrite relay.cfg with the current enabled state as its first line,
+        /* Rewrite relay.cfg with the current settings as its first lines,
            preserving every other line. Best-effort: a write failure only
-           costs persistence across the next reboot, never the live toggle. */
-        void PersistEnabled(bool on) {
+           costs persistence across the next reboot, never the live state. */
+        void PersistConfig() {
             char buf[1024] = {};
             fs::FileHandle f;
             if (R_SUCCEEDED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
@@ -180,17 +230,23 @@ namespace ams::mitm::ldn::relay {
                 fs::CloseFile(f);
             }
 
-            char out[1152];
-            size_t pos = static_cast<size_t>(std::snprintf(out, sizeof(out), "enabled=%d\n", on ? 1 : 0));
+            char out[1280];
+            size_t pos = static_cast<size_t>(std::snprintf(out, sizeof(out), "enabled=%d\nbroadcast=%d\n",
+                g_enabled.load() ? 1 : 0, LdnConfig::getBroadcastRelay() ? 1 : 0));
+            const int sel = g_selected.load();
+            if (sel >= 0 && sel < g_count) {
+                pos += static_cast<size_t>(std::snprintf(out + pos, sizeof(out) - pos,
+                    "selected=%s\n", g_servers[sel].name));
+            }
+
             char *save = nullptr;
             for (char *line = strtok_r(buf, "\r\n", std::addressof(save));
                  line != nullptr;
                  line = strtok_r(nullptr, "\r\n", std::addressof(save))) {
                 const char *p = line;
                 while (*p == ' ' || *p == '\t') { p++; }
-                /* Drop old enabled lines; ours is already at the top. */
-                if (std::strncmp(p, "enabled", 7) == 0 &&
-                    (p[7] == '\0' || p[7] == '=' || p[7] == ' ' || p[7] == '\t')) {
+                /* Drop old directive lines; ours are already at the top. */
+                if (IsDirectiveLine(p)) {
                     continue;
                 }
                 const size_t need = std::strlen(line) + 1;
@@ -205,28 +261,30 @@ namespace ams::mitm::ldn::relay {
             if (R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
                 if (R_FAILED(fs::CreateFile(RelayConfigPath, 0)) ||
                     R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
-                    LogFormat("relay: persisting enabled=%d failed (open)", on ? 1 : 0);
+                    LogFormat("relay: persisting settings failed (open)");
                     return;
                 }
             }
             fs::SetFileSize(f, 0);
             if (R_FAILED(fs::WriteFile(f, 0, out, pos, fs::WriteOption::Flush))) {
-                LogFormat("relay: persisting enabled=%d failed (write)", on ? 1 : 0);
+                LogFormat("relay: persisting settings failed (write)");
             }
             fs::CloseFile(f);
         }
     }
 
+    void PersistSettings()    { PersistConfig(); }
+
     /* Effective gate: user turned it on AND at least one server exists. */
     bool IsEnabled()          { return g_enabled.load() && g_count > 0; }
-    void SetRelayEnabled(bool on) { g_enabled = on; PersistEnabled(on); }
+    void SetRelayEnabled(bool on) { g_enabled = on; PersistConfig(); }
     bool GetRelayEnabled()    { return g_enabled.load(); }
 
     int  ServerCount()        { return g_count; }
     const char *ServerName(int i) { return (i >= 0 && i < g_count) ? g_servers[i].name : ""; }
 
     int  SelectedServer()     { return g_selected.load(); }
-    void SelectServer(int i)  { if (i >= 0 && i < g_count) { g_selected = i; } }
+    void SelectServer(int i)  { if (i >= 0 && i < g_count) { g_selected = i; PersistConfig(); } }
 
     /* Selected server's literal IPv4 (host order), or 0 if it is a hostname
        (resolved by RelayTransport at connect time). */

@@ -11,9 +11,11 @@
 # Listing servers here does NOT turn the relay on. Open the Tesla overlay,
 # toggle "Internet relay" on, and pick a server. Relay off = normal local LDN.
 #
-# The overlay toggle is saved back into this file as an "enabled=0/1" line,
-# so it survives reboots. You can also set it here yourself:
-#enabled=1
+# The overlay settings are saved back into this file as directive lines, so
+# they survive reboots. You can also preset them here yourself:
+#enabled=1          internet relay on at boot
+#broadcast=1        bsd broadcast relay (the lag fix; on by default)
+#selected=my-pc     which server from the list below is active (by name)
 
 my-pc        82.65.234.243:11455
 lan-play     104.238.152.86

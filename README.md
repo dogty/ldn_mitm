@@ -36,9 +36,9 @@ Open the Tesla overlay to find these toggles:
 | Option | What it does |
 | --- | --- |
 | **Enabled** | Master switch for ldn_mitm. |
-| **Broadcast relay** | On-console broadcast→unicast relay (the lag fix above). Safe to leave on. |
+| **Broadcast relay** | On-console broadcast→unicast relay (the lag fix above). Safe to leave on. Saved to `relay.cfg`. |
 | **Internet relay** | Turn cross-internet play on/off. Off = normal local LDN. Saved to `relay.cfg`, so it survives reboots. |
-| *(server list)* | The relay servers from your config file; select one with **A** (`*` = active). |
+| *(server list)* | The relay servers from your config file; select one with **A** (`*` = active). The choice is saved to `relay.cfg`. |
 | **Logging** | Write a debug log to `sdmc:/ldn_mitm.log`. |
 
 ### Setting up internet play

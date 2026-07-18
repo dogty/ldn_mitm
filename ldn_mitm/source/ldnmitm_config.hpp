@@ -16,6 +16,11 @@ namespace ams::mitm::ldn {
             static bool getBroadcastRelay() {
                 return BroadcastRelay;
             }
+            /* Also used by relay::LoadConfig to restore the persisted value
+               (relay.cfg "broadcast=" directive) at boot. */
+            static void setBroadcastRelay(bool v) {
+                BroadcastRelay = v;
+            }
         protected:
             static std::atomic_bool LdnEnabled;
             static std::atomic_bool BroadcastRelay;
