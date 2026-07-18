@@ -20,25 +20,14 @@
 
 namespace ams::mitm::ldn {
 
-    /* On-console internet relay client (docs/internet-relay-plan.md).
-
-       Lets two consoles on DIFFERENT networks play an LDN game together with
-       no PC on either end, by relaying LDN discovery/join AND game session
-       traffic through a lan-play relay server. Speaks lan-play's protocol
-       (UDP to server, [u8 type][payload]; keepalive 0x00, IPv4 0x01).
-
-       Enabled per-console by dropping a config file at RelayConfigPath with a
-       relay server address; absent = normal local-only LDN (shipped default).
-       See LoadConfig. */
+    /* On-console internet relay client (docs/internet-relay-plan.md): two
+       consoles on different networks play an LDN game with no PC, by relaying
+       LDN discovery/join and game traffic through a lan-play relay server
+       (UDP, [u8 type][payload]; keepalive 0x00, IPv4 0x01). Off unless
+       configured AND enabled in the overlay. */
     namespace relay {
 
-        /* Config file listing relay servers, one per line:
-             MyServer 82.65.234.243:11455
-             public   relay.example.com     (hostname, default port 11451)
-           Address may be an IPv4 literal or a hostname (resolved via DNS at
-           connect time); '#' and blank lines ignored. The list only feeds the
-           picker - relay stays OFF (normal local LDN) until the user enables
-           it and chooses a server in the Tesla overlay. */
+        /* Server list config; format documented at LoadConfig (relay_client.cpp). */
         constexpr const char RelayConfigPath[] = "sdmc:/config/ldn_mitm/relay.cfg";
         constexpr int MaxServers    = 8;
         constexpr int ServerNameLen = 32;
@@ -75,10 +64,8 @@ namespace ams::mitm::ldn {
         const char *ServerHost();
         u16 ServerPort();
 
-        /* Thread-safe entry for the bsd:u mitm (its IPC threads, not the
-           LANDiscovery worker that owns the transport). Wraps the payload and
-           sends it to the relay. No-op (returns -1) when the relay transport
-           is not open. dport is the game's destination port, host order. */
+        /* Thread-safe entry for bsd:u IPC threads: wrap the payload and send to
+           the relay. Returns -1 when the transport is closed. dport host order. */
         int BridgeSendGameBroadcast(const void *payload, size_t len, u16 dport);
 
         /* Like BridgeSendGameBroadcast but for a unicast to a specific peer:
@@ -99,50 +86,46 @@ namespace ams::mitm::ldn {
 
                 /* Acquire internet, open+register+connect the socket. The
                    virtual src (10.13.<ip3>.<ip4>) is derived from our real IP
-                   so peers can tell us apart. Returns success only when the
-                   socket is ready. */
+                   so peers can tell us apart. */
                 Result Open();
                 void Close();
                 bool IsOpen() const { return m_fd >= 0; }
                 int GetFd() const { return m_fd; }
-                u32 GetVirtualSrc() const { return m_vsrc; }
 
-                /* Wrap a LANPacket as an IPv4/UDP broadcast (from our virtual
-                   src to 10.13.255.255:11452) and send it to the relay. */
+                /* Wrap a LANPacket as an IPv4/UDP broadcast (virtual src ->
+                   10.13.255.255:11452) and send it to the relay. */
                 int SendBroadcast(const void *lan_packet, size_t size);
 
-                /* Keep our registration alive when we are otherwise silent
-                   (e.g. an idle host). Call periodically from the worker. */
+                /* Keep our registration alive while otherwise silent (an idle
+                   host). Call periodically from the worker. */
                 int SendKeepalive();
 
-                /* Receive one relay frame. A type-0x01 IPv4/UDP frame to port
-                   11452 (LDN discovery) is copied into out (returns its
-                   length); a frame to any other port is a peer game frame and
-                   is handed to the game via the GameRx queue (returns 0).
-                   Returns 0 on timeout/other frames, <0 on error. Also outputs
-                   the frame's source virtual IP (host order). */
+                /* Receive one relay frame. A discovery frame (UDP dst 11452) is
+                   copied to out (returns length, sets *out_src_ip to its virtual
+                   IP); a peer game frame is handed to GameRx (returns 0). <0 on
+                   error. */
                 int RecvBroadcast(void *out, size_t max_size, u32 *out_src_ip);
 
-                /* Wrap a game datagram as IPv4/UDP (src = our REAL IP, dst =
-                   255.255.255.255, sport = dport - the true source port is
-                   not visible in the SendTo hook; symmetric game protocols
-                   send port N -> port N) and send it to the relay. Called via
-                   BridgeSendGameBroadcast from bsd:u mitm threads. */
+                /* Wrap a game datagram (src = our real IP, dst = 255.255.255.255,
+                   sport = dport) and send to the relay. Called from bsd:u mitm
+                   threads via BridgeSendGameBroadcast. */
                 int SendGameBroadcast(const void *payload, size_t len, u16 dport);
 
-                /* As SendGameBroadcast but dst = dst_ip (host order) for
-                   unicast session traffic routed to a specific peer. */
+                /* As SendGameBroadcast but dst = dst_ip (host order): the relay
+                   routes it to the owning peer. */
                 int SendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip);
 
             private:
-                /* Resolve a hostname to an IPv4 (host order) with a hand-built
-                   DNS query over an nifm-registered socket. 0 on failure. */
+                /* Build [0x01][IPv4+UDP+payload] and send to the relay. */
+                int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
+
+                /* Resolve a hostname to IPv4 (host order) via a hand-built DNS
+                   query (libnx getaddrinfo aborts in this sysmodule). 0 on
+                   failure. */
                 u32 ResolveHostname(const char *host);
 
-                /* Queue one relay-received peer game frame for the game to
-                   receive via the bsd:u mitm's RecvFrom (with the peer's real
-                   source address - the stack cannot deliver a spoofed source
-                   locally, so we serve it directly). */
+                /* Queue a relay-received peer frame for the bsd:u RecvFrom to
+                   serve with the peer's real source address. */
                 void InjectGameFrame(const u8 *ip, size_t iplen);
 
                 int m_fd = -1;

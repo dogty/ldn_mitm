@@ -39,12 +39,8 @@ namespace ams::mitm::ldn::relay {
         constexpr u8 TypeKeepalive = 0x00;
         constexpr u8 TypeIpv4      = 0x01;
 
-        /* Largest game/LAN payload we can wrap: the 1500-byte frame buffer
-           minus the 1-byte relay type, 20-byte IPv4 header and 8-byte UDP
-           header (1500 - 29). A full MTU-1500 datagram carries up to 1472
-           payload bytes, but 1472 would need a 1501-byte buffer; the games
-           that push near-MTU frames (pia titles) still fit under this. A
-           tighter cap silently dropped valid 1401-1471 byte datagrams. */
+        /* 1500-byte frame minus relay type (1) + IPv4 (20) + UDP (8). Must
+           admit near-MTU game datagrams (pia titles). */
         constexpr size_t MaxWrapPayload = 1500 - 1 - 20 - 8; /* 1471 */
 
         /* IPv4 header checksum (16-bit ones-complement over the header). */
@@ -99,6 +95,23 @@ namespace ams::mitm::ldn::relay {
                    DirectiveValue(l, "broadcast") != nullptr ||
                    DirectiveValue(l, "selected")  != nullptr;
         }
+
+        /* Read relay.cfg into buf (NUL-terminated; empty on any failure). */
+        void ReadConfigFile(char *buf, size_t cap) {
+            buf[0] = '\0';
+            fs::FileHandle f;
+            if (R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
+                return;
+            }
+            s64 size = 0;
+            if (R_SUCCEEDED(fs::GetFileSize(std::addressof(size), f)) && size > 0) {
+                const size_t n = static_cast<size_t>(size) < cap - 1 ? static_cast<size_t>(size) : cap - 1;
+                if (R_SUCCEEDED(fs::ReadFile(f, 0, buf, n))) {
+                    buf[n] = '\0';
+                }
+            }
+            fs::CloseFile(f);
+        }
     }
 
     void LoadConfig() {
@@ -116,20 +129,8 @@ namespace ams::mitm::ldn::relay {
         g_enabled = false;
         char pending_selected[ServerNameLen] = {};
 
-        fs::FileHandle f;
-        if (R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
-            return;
-        }
-        s64 size = 0;
-        char buf[1024] = {};
-        if (R_SUCCEEDED(fs::GetFileSize(std::addressof(size), f)) && size > 0) {
-            const size_t n = static_cast<size_t>(size) < sizeof(buf) - 1
-                                 ? static_cast<size_t>(size) : sizeof(buf) - 1;
-            if (R_SUCCEEDED(fs::ReadFile(f, 0, buf, n))) {
-                buf[n] = '\0';
-            }
-        }
-        fs::CloseFile(f);
+        char buf[1024];
+        ReadConfigFile(buf, sizeof(buf));
 
         char *save = nullptr;
         for (char *line = strtok_r(buf, "\r\n", std::addressof(save));
@@ -214,21 +215,9 @@ namespace ams::mitm::ldn::relay {
            preserving every other line. Best-effort: a write failure only
            costs persistence across the next reboot, never the live state. */
         void PersistConfig() {
-            char buf[1024] = {};
+            char buf[1024];
+            ReadConfigFile(buf, sizeof(buf));
             fs::FileHandle f;
-            if (R_SUCCEEDED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
-                s64 size = 0;
-                if (R_SUCCEEDED(fs::GetFileSize(std::addressof(size), f)) && size > 0) {
-                    const size_t n = static_cast<size_t>(size) < sizeof(buf) - 1
-                                         ? static_cast<size_t>(size) : sizeof(buf) - 1;
-                    if (R_FAILED(fs::ReadFile(f, 0, buf, n))) {
-                        buf[0] = '\0';
-                    } else {
-                        buf[n] = '\0';
-                    }
-                }
-                fs::CloseFile(f);
-            }
 
             char out[1280];
             size_t pos = static_cast<size_t>(std::snprintf(out, sizeof(out), "enabled=%d\nbroadcast=%d\n",
@@ -302,15 +291,9 @@ namespace ams::mitm::ldn::relay {
         return (i >= 0 && i < g_count) ? g_servers[i].port : 0;
     }
 
-    /* ---- Game-traffic bridge (Phase 2 session traffic) ----
-       The bsd:u mitm's IPC threads need to hand game payloads to the relay
-       socket, which is owned by the LANDiscovery worker and torn down on
-       finalize. A mutex-guarded global pointer gives them a safe rendezvous:
-       Open() registers the transport, Close() unregisters it BEFORE anything
-       is destroyed, and the send happens under the mutex, so a game send can
-       never race the teardown into a use-after-close. sendto on a shared fd
-       is atomic per datagram, and the fd is non-blocking, so holding the
-       mutex across the send is cheap. */
+    /* Rendezvous for bsd:u IPC threads to reach the relay socket (owned by the
+       LANDiscovery worker). Open()/Close() register/unregister under the mutex
+       and the send happens under it, so a game send can't race teardown. */
     namespace {
         constinit os::SdkMutex g_bridge_mutex;
         constinit RelayTransport *g_bridge_transport = nullptr;
@@ -436,8 +419,8 @@ namespace ams::mitm::ldn::relay {
     }
 
     Result RelayTransport::Open() {
-        /* Internet route (proven chain): nifm session + request + register the
-           socket, deliberately NOT LocalNetworkMode. */
+        /* Internet route: nifm session + request + registered socket, NOT
+           LocalNetworkMode. */
         Result rc = NifmSessionManager::Acquire();
         if (R_FAILED(rc)) {
             LogFormat("relay xport: nifm acquire failed %x", rc);
@@ -468,10 +451,9 @@ namespace ams::mitm::ldn::relay {
             svcSleepThread(500000000L); /* 0.5s */
         }
 
-        /* Virtual src 10.13.<ip3>.<ip4> from our real IP, so peers tell us
-           apart over the relay (and never see their own echo). The real IP is
-           kept too: game frames are stamped with it (it is what NodeInfo
-           advertises), so the peer's game accepts them as genuine LAN traffic. */
+        /* Virtual src 10.13.<ip3>.<ip4> from our real IP so peers tell us
+           apart; the real IP is kept too - game frames are stamped with it
+           (NodeInfo advertises it) so peers accept them as genuine LAN. */
         u32 ip = 0;
         if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ip))) {
             ip = ntohl(ip);
@@ -482,10 +464,8 @@ namespace ams::mitm::ldn::relay {
             m_vsrc = (10u << 24) | (13u << 16) | 0x0001;
         }
 
-        /* Resolve the server: a literal IP is used directly; a hostname is
-           resolved by our own tiny DNS client (libnx's getaddrinfo aborts in
-           this sysmodule - its resolver allocates through a path AMS does not
-           support). 0 = bad/unresolvable -> fail and fall back to local LDN. */
+        /* Literal IP used directly; a hostname goes through our own DNS client.
+           0 = unresolvable -> fail and fall back to local LDN. */
         u32 server_ip = ServerIp();
         if (server_ip == 0) {
             server_ip = this->ResolveHostname(ServerHost());
@@ -510,8 +490,7 @@ namespace ams::mitm::ldn::relay {
 
         nifmRequestRegisterSocketDescriptor(&m_req, fd);
 
-        /* Connect so recv only accepts the server and a local port binds.
-           Short retry: LANDiscovery init runs long after boot, link is up. */
+        /* Connect so recv only accepts the server and a local port binds. */
         int conn = -1;
         for (int i = 0; i < 3; i++) {
             conn = connect(fd, (struct sockaddr *)&srv, sizeof(srv));
@@ -528,8 +507,7 @@ namespace ams::mitm::ldn::relay {
             return MAKERESULT(0xFD, 101);
         }
 
-        /* Non-blocking: the LANDiscovery worker polls this fd and only recvs
-           when readable, but stay non-blocking to be safe. */
+        /* Non-blocking: the worker polls and only recvs when readable. */
         const int flags = fcntl(fd, F_GETFL, 0);
         if (flags >= 0) {
             fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -550,8 +528,8 @@ namespace ams::mitm::ldn::relay {
     }
 
     void RelayTransport::Close() {
-        /* Unregister the bridge FIRST: after this no bsd thread can enter
-           SendGameBroadcast on this object, so the closes below are safe. */
+        /* Unregister the bridge first: after this no bsd thread can enter a
+           send on this object, so the closes below are safe. */
         {
             std::scoped_lock lk(g_bridge_mutex);
             if (g_bridge_transport == this) {
@@ -584,36 +562,40 @@ namespace ams::mitm::ldn::relay {
         return send(m_fd, &ka, sizeof(ka), 0);
     }
 
-    int RelayTransport::SendBroadcast(const void *lan_packet, size_t size) {
-        if (m_fd < 0 || size > MaxWrapPayload) {
-            return -1;
-        }
-        /* [0x01][IPv4(20) + UDP(8) + LANPacket] from vsrc -> 10.13.255.255. */
+    int RelayTransport::SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len) {
         u8 buf[1500];
-        const u16 udplen = static_cast<u16>(8 + size);
+        const u16 udplen = static_cast<u16>(8 + len);
         const u16 total  = static_cast<u16>(20 + udplen);
         buf[0] = TypeIpv4;
         u8 *ip = buf + 1;
         ip[0] = 0x45; ip[1] = 0x00; ip[2] = total >> 8; ip[3] = total & 0xff;
-        ip[4] = 0x42; ip[5] = 0x43; ip[6] = 0x40; ip[7] = 0x00;
+        ip[4] = ip_id >> 8; ip[5] = ip_id & 0xff; ip[6] = 0x40; ip[7] = 0x00; /* DF */
         ip[8] = 64; ip[9] = 17; ip[10] = 0; ip[11] = 0;
-        ip[12] = (m_vsrc >> 24) & 0xff; ip[13] = (m_vsrc >> 16) & 0xff;
-        ip[14] = (m_vsrc >> 8) & 0xff;  ip[15] = m_vsrc & 0xff;
-        ip[16] = 10; ip[17] = 13; ip[18] = 255; ip[19] = 255;
+        ip[12] = (src >> 24) & 0xff; ip[13] = (src >> 16) & 0xff;
+        ip[14] = (src >> 8) & 0xff;  ip[15] = src & 0xff;
+        ip[16] = (dst >> 24) & 0xff; ip[17] = (dst >> 16) & 0xff;
+        ip[18] = (dst >> 8) & 0xff;  ip[19] = dst & 0xff;
         const u16 cs = IpChecksum(ip, 20);
         ip[10] = cs >> 8; ip[11] = cs & 0xff;
         u8 *udp = ip + 20;
-        udp[0] = 11452 >> 8; udp[1] = 11452 & 0xff;
-        udp[2] = 11452 >> 8; udp[3] = 11452 & 0xff;
+        udp[0] = sport >> 8; udp[1] = sport & 0xff;
+        udp[2] = dport >> 8; udp[3] = dport & 0xff;
         udp[4] = udplen >> 8; udp[5] = udplen & 0xff;
         udp[6] = 0; udp[7] = 0;
-        std::memcpy(udp + 8, lan_packet, size);
+        std::memcpy(udp + 8, payload, len);
         return send(m_fd, buf, 1 + total, 0);
     }
 
+    int RelayTransport::SendBroadcast(const void *lan_packet, size_t size) {
+        if (m_fd < 0 || size > MaxWrapPayload) {
+            return -1;
+        }
+        /* vsrc -> 10.13.255.255:11452, ip id "BC". */
+        return this->SendWrapped(m_vsrc, 0x0A0DFFFFu, 11452, 11452, 0x4243, lan_packet, size);
+    }
+
     int RelayTransport::SendGameBroadcast(const void *payload, size_t len, u16 dport) {
-        /* dst 255.255.255.255: unambiguous broadcast for the relay's routing,
-           regardless of either console's netmask. */
+        /* dst 255.255.255.255: unambiguous broadcast regardless of netmask. */
         return this->SendGameUnicast(payload, len, dport, 0xFFFFFFFFu);
     }
 
@@ -621,31 +603,9 @@ namespace ams::mitm::ldn::relay {
         if (m_fd < 0 || m_rsrc == 0 || len == 0 || len > MaxWrapPayload) {
             return -1;
         }
-        /* [0x01][IPv4(20) + UDP(8) + game payload] from our REAL IP to dst_ip.
-           sport = dport: the true source port is not visible in the SendTo
-           hook; symmetric game protocols send port N -> port N. The relay
-           routes by dst - broadcast to all clients, unicast to the owner. */
-        u8 buf[1500];
-        const u16 udplen = static_cast<u16>(8 + len);
-        const u16 total  = static_cast<u16>(20 + udplen);
-        buf[0] = TypeIpv4;
-        u8 *ip = buf + 1;
-        ip[0] = 0x45; ip[1] = 0x00; ip[2] = total >> 8; ip[3] = total & 0xff;
-        ip[4] = 0x47; ip[5] = 0x4D; ip[6] = 0x40; ip[7] = 0x00; /* id "GM", DF */
-        ip[8] = 64; ip[9] = 17; ip[10] = 0; ip[11] = 0;
-        ip[12] = (m_rsrc >> 24) & 0xff; ip[13] = (m_rsrc >> 16) & 0xff;
-        ip[14] = (m_rsrc >> 8) & 0xff;  ip[15] = m_rsrc & 0xff;
-        ip[16] = (dst_ip >> 24) & 0xff; ip[17] = (dst_ip >> 16) & 0xff;
-        ip[18] = (dst_ip >> 8) & 0xff;  ip[19] = dst_ip & 0xff;
-        const u16 cs = IpChecksum(ip, 20);
-        ip[10] = cs >> 8; ip[11] = cs & 0xff;
-        u8 *udp = ip + 20;
-        udp[0] = dport >> 8; udp[1] = dport & 0xff;
-        udp[2] = dport >> 8; udp[3] = dport & 0xff;
-        udp[4] = udplen >> 8; udp[5] = udplen & 0xff;
-        udp[6] = 0; udp[7] = 0;
-        std::memcpy(udp + 8, payload, len);
-        return send(m_fd, buf, 1 + total, 0);
+        /* From our real IP to dst_ip; sport = dport (the true source port isn't
+           visible in the SendTo hook; symmetric protocols send N -> N). */
+        return this->SendWrapped(m_rsrc, dst_ip, dport, dport, 0x474D, payload, len);
     }
 
     void RelayTransport::InjectGameFrame(const u8 *ip, size_t iplen) {
@@ -666,24 +626,20 @@ namespace ams::mitm::ldn::relay {
         }
         const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
 
-        /* Our own frame echoed back (a relay can reflect it) - never feed the
-           game its own traffic. */
+        /* Our own frame echoed back by the relay - never feed the game its own
+           traffic. */
         if (src == m_rsrc) {
             return;
         }
-        /* Only inject during an active LDN session; never spray other relay
-           users' traffic at local ports outside one. */
+        /* Only inject during an active LDN session. */
         SessionRegistry::Snapshot snap;
         SessionRegistry::Get(&snap);
         if (!snap.active) {
             return;
         }
 
-        /* No socket send can deliver a peer's source IP locally on this stack
-           (raw egresses without looping back; a dgram to our own IP loops back
-           but carries OUR source). So hand the frame to the bsd:u mitm's
-           RecvFrom queue, which serves it to the game with the peer's real
-           source address, bypassing the stack. */
+        /* The stack can't deliver a peer's source IP locally, so hand the frame
+           to the bsd:u RecvFrom queue, which serves it with the real source. */
         GameRx::Push(src, sport, dport, payload, plen);
     }
 
