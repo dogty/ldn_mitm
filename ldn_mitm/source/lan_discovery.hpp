@@ -237,6 +237,12 @@ namespace ams::mitm::ldn {
             /* Host side: when we last advertised over the relay (worker beacon
                or Scan reply), for the rate limit above. Guarded by dataMutex. */
             os::Tick lastRelayAdvertise = os::Tick(0);
+            /* What initialize() latched, so openAccessPoint/openStation can
+               detect that the overlay toggle changed since and rebuild the
+               session in the right mode (see refreshRelayMode). */
+            bool initRelay = false;
+            bool initListening = true;
+            Result refreshRelayMode();
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;

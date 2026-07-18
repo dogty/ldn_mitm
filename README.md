@@ -37,7 +37,7 @@ Open the Tesla overlay to find these toggles:
 | --- | --- |
 | **Enabled** | Master switch for ldn_mitm. |
 | **Broadcast relay** | On-console broadcast→unicast relay (the lag fix above). Safe to leave on. |
-| **Internet relay** | Turn cross-internet play on/off. Off = normal local LDN. |
+| **Internet relay** | Turn cross-internet play on/off. Off = normal local LDN. Saved to `relay.cfg`, so it survives reboots. |
 | *(server list)* | The relay servers from your config file; select one with **A** (`*` = active). |
 | **Logging** | Write a debug log to `sdmc:/ldn_mitm.log`. |
 
@@ -69,7 +69,8 @@ Open the Tesla overlay to find these toggles:
    the relay on.
 
 3. **In the Tesla overlay**, toggle **Internet relay** on and pick a server.
-   The choice takes effect the next time a game starts an LDN session.
+   The toggle is remembered across reboots, and takes effect the next time
+   the game opens its host/join menu — no need to restart the game.
 
 4. **Both players** point their consoles at the **same** relay server, then
    host/join the LDN game normally. Keep both consoles on the default DHCP

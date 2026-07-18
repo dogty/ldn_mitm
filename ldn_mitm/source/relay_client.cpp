@@ -80,8 +80,9 @@ namespace ams::mitm::ldn::relay {
              MyServer 82.65.234.243:11455
              lan-play 1.2.3.4              (default port 11451)
            IPv4 only; lines starting with '#' and blank lines are ignored.
-           The list only populates the picker - relay stays off until the user
-           enables it in the Tesla overlay. */
+           An "enabled=1" line turns the relay on at boot; the Tesla overlay
+           toggle rewrites it (SetRelayEnabled), so the choice survives
+           reboots instead of silently resetting to off. */
         g_count = 0;
         g_selected = 0;
         g_enabled = false;
@@ -107,6 +108,16 @@ namespace ams::mitm::ldn::relay {
              line = strtok_r(nullptr, "\r\n", std::addressof(save))) {
             while (*line == ' ' || *line == '\t') { line++; }
             if (*line == '#' || *line == '\0') {
+                continue;
+            }
+            /* Directive line, not a server: enabled=0/1. Must be matched
+               before server parsing or it would register as a bogus server
+               named "enabled=1". */
+            if (std::strncmp(line, "enabled", 7) == 0 &&
+                (line[7] == '\0' || line[7] == '=' || line[7] == ' ' || line[7] == '\t')) {
+                const char *v = line + 7;
+                while (*v == '=' || *v == ' ' || *v == '\t') { v++; }
+                g_enabled = (std::atoi(v) != 0);
                 continue;
             }
             char name[ServerNameLen] = {};
@@ -148,9 +159,67 @@ namespace ams::mitm::ldn::relay {
         LogFormat("relay: loaded %d server(s)", g_count);
     }
 
+    namespace {
+        /* Rewrite relay.cfg with the current enabled state as its first line,
+           preserving every other line. Best-effort: a write failure only
+           costs persistence across the next reboot, never the live toggle. */
+        void PersistEnabled(bool on) {
+            char buf[1024] = {};
+            fs::FileHandle f;
+            if (R_SUCCEEDED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Read))) {
+                s64 size = 0;
+                if (R_SUCCEEDED(fs::GetFileSize(std::addressof(size), f)) && size > 0) {
+                    const size_t n = static_cast<size_t>(size) < sizeof(buf) - 1
+                                         ? static_cast<size_t>(size) : sizeof(buf) - 1;
+                    if (R_FAILED(fs::ReadFile(f, 0, buf, n))) {
+                        buf[0] = '\0';
+                    } else {
+                        buf[n] = '\0';
+                    }
+                }
+                fs::CloseFile(f);
+            }
+
+            char out[1152];
+            size_t pos = static_cast<size_t>(std::snprintf(out, sizeof(out), "enabled=%d\n", on ? 1 : 0));
+            char *save = nullptr;
+            for (char *line = strtok_r(buf, "\r\n", std::addressof(save));
+                 line != nullptr;
+                 line = strtok_r(nullptr, "\r\n", std::addressof(save))) {
+                const char *p = line;
+                while (*p == ' ' || *p == '\t') { p++; }
+                /* Drop old enabled lines; ours is already at the top. */
+                if (std::strncmp(p, "enabled", 7) == 0 &&
+                    (p[7] == '\0' || p[7] == '=' || p[7] == ' ' || p[7] == '\t')) {
+                    continue;
+                }
+                const size_t need = std::strlen(line) + 1;
+                if (pos + need >= sizeof(out)) {
+                    break;
+                }
+                std::memcpy(out + pos, line, need - 1);
+                out[pos + need - 1] = '\n';
+                pos += need;
+            }
+
+            if (R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
+                if (R_FAILED(fs::CreateFile(RelayConfigPath, 0)) ||
+                    R_FAILED(fs::OpenFile(std::addressof(f), RelayConfigPath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
+                    LogFormat("relay: persisting enabled=%d failed (open)", on ? 1 : 0);
+                    return;
+                }
+            }
+            fs::SetFileSize(f, 0);
+            if (R_FAILED(fs::WriteFile(f, 0, out, pos, fs::WriteOption::Flush))) {
+                LogFormat("relay: persisting enabled=%d failed (write)", on ? 1 : 0);
+            }
+            fs::CloseFile(f);
+        }
+    }
+
     /* Effective gate: user turned it on AND at least one server exists. */
     bool IsEnabled()          { return g_enabled.load() && g_count > 0; }
-    void SetRelayEnabled(bool on) { g_enabled = on; }
+    void SetRelayEnabled(bool on) { g_enabled = on; PersistEnabled(on); }
     bool GetRelayEnabled()    { return g_enabled.load(); }
 
     int  ServerCount()        { return g_count; }

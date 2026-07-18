@@ -1057,11 +1057,31 @@ namespace ams::mitm::ldn {
         return 0;
     }
 
+    Result LANDiscovery::refreshRelayMode() {
+        /* The relay decision is latched at initialize(): it selects the nifm
+           request mode (plain internet vs LocalNetworkMode) AND whether the
+           relay transport opens, so a live toggle cannot simply open a
+           socket later. The game only reaches openAccessPoint/openStation
+           from its host/join menus - never mid-session - so if the overlay
+           toggle changed since the latch, rebuild the whole network session
+           in the right mode. Users no longer need to relaunch the game after
+           flipping the internet relay. */
+        if (!this->initialized || this->initRelay == relay::IsEnabled()) {
+            return 0;
+        }
+        LogFormat("relay toggle changed (%d -> %d): reinitializing network session",
+            static_cast<int>(this->initRelay), static_cast<int>(relay::IsEnabled()));
+        LanEventFunc ev = this->lanEvent;
+        this->finalize();  /* failures are logged inside; state is torn down regardless */
+        R_RETURN(this->initialize(ev, this->initListening));
+    }
+
     Result LANDiscovery::openAccessPoint() {
         this->disconnect_reason = DisconnectReason::None;
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
+        R_TRY(this->refreshRelayMode());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1100,6 +1120,7 @@ namespace ams::mitm::ldn {
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
+        R_TRY(this->refreshRelayMode());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1471,6 +1492,8 @@ namespace ams::mitm::ldn {
            relay, or LocalNetworkMode with a relay socket that can't reach the
            server). One read keeps them consistent. */
         const bool use_relay = relay::IsEnabled();
+        this->initRelay = use_relay;
+        this->initListening = listening;
 
         /* Relay mode keeps the console on the INTERNET (so the relay socket
            can reach the server), so skip LocalNetworkMode; the submitted
