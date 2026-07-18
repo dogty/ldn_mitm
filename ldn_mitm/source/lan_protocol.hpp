@@ -7,9 +7,8 @@ enum class LANPacketType : u8 {
     ScanResp,
     Connect,
     SyncNetwork,
-    /* Relay mode only: periodic liveness signal from a connected station,
-       broadcast over the relay so its host can detect a vanished peer (no
-       TCP close exists there). Builds without it ignore unknown types. */
+    /* Relay mode only: periodic station liveness signal (no TCP close exists
+       there). Older builds ignore unknown types. */
     RelayHeartbeat,
 };
 

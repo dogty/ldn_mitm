@@ -35,7 +35,6 @@ give the players this machine's PUBLIC IP (or a hostname) and port.
 """
 import argparse
 import socket
-import struct
 import time
 
 TYPE_KEEPALIVE = 0x00
@@ -66,8 +65,8 @@ def main():
 
     # virtual-src (4 bytes) -> (udp_endpoint, last_seen)
     clients = {}
-    # udp_endpoint -> True, so a brand-new endpoint is announced once
-    endpoints = {}
+    # endpoints seen, so a brand-new one is announced once
+    endpoints = set()
 
     def active_endpoints(now, exclude=None):
         """Live client endpoints (deduped, idle ones expired)."""
@@ -90,18 +89,15 @@ def main():
             continue
 
         if addr not in endpoints:
-            endpoints[addr] = True
+            endpoints.add(addr)
             print(f"[relay] new client {addr[0]}:{addr[1]}  ({len(active_endpoints(time.time())) + 1} online)")
 
         now = time.time()
         msg_type, payload = data[0], data[1:]
 
         if msg_type == TYPE_KEEPALIVE:
-            # Refresh every IP already learned from this endpoint. A keepalive
-            # carries no address, so it can only refresh - never learn - a
-            # mapping; a still-idle but unlearned client stays unroutable until
-            # it sends an IPv4 frame (which ldn_mitm does via its periodic
-            # advertisement re-broadcast).
+            # Refresh (never learn) mappings for this endpoint - keepalives
+            # carry no address.
             for vsrc, (ep, _) in list(clients.items()):
                 if ep == addr:
                     clients[vsrc] = (ep, now)

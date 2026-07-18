@@ -17,83 +17,21 @@ char g_version[32];
 // Relay server picker: the ListItems, so a selection updates every marker.
 std::vector<tsl::elm::ListItem*> g_serverItems;
 
-class InternetRelayToggleListItem : public tsl::elm::ToggleListItem {
+// One toggle bound to a config get/set pair (all share the same signature).
+class ConfigToggleListItem : public tsl::elm::ToggleListItem {
 public:
-    InternetRelayToggleListItem() : ToggleListItem("Internet relay", false) {
+    ConfigToggleListItem(const char *label,
+                         Result (*get)(LdnMitmConfigService *, u32 *),
+                         Result (*set)(LdnMitmConfigService *, u32))
+        : ToggleListItem(label, false) {
         u32 enabled = 0;
-        if (R_FAILED(ldnMitmGetInternetRelay(&g_ldnConfig, &enabled))) {
+        if (R_FAILED(get(&g_ldnConfig, &enabled))) {
             g_state = State::Error;
         }
         this->setState(enabled);
 
-        this->setStateChangedListener([](bool enabled) {
-            if (R_FAILED(ldnMitmSetInternetRelay(&g_ldnConfig, enabled))) {
-                g_state = State::Error;
-            }
-        });
-    }
-};
-
-class EnabledToggleListItem : public tsl::elm::ToggleListItem {
-public:
-    EnabledToggleListItem() : ToggleListItem("Enabled", false) {
-        u32 enabled;
-        Result rc;
-
-        rc = ldnMitmGetEnabled(&g_ldnConfig, &enabled);
-        if (R_FAILED(rc)) {
-            g_state = State::Error;
-        }
-
-        this->setState(enabled);
-
-        this->setStateChangedListener([](bool enabled) {
-            Result rc = ldnMitmSetEnabled(&g_ldnConfig, enabled);
-            if (R_FAILED(rc)) {
-                g_state = State::Error;
-            }
-        });
-    }
-};
-
-class LoggingToggleListItem : public tsl::elm::ToggleListItem {
-public:
-    LoggingToggleListItem() : ToggleListItem("Logging", false) {
-        u32 enabled;
-        Result rc;
-
-        rc = ldnMitmGetLogging(&g_ldnConfig, &enabled);
-        if (R_FAILED(rc)) {
-            g_state = State::Error;
-        }
-
-        this->setState(enabled);
-
-        this->setStateChangedListener([](bool enabled) {
-            Result rc = ldnMitmSetLogging(&g_ldnConfig, enabled);
-            if (R_FAILED(rc)) {
-                g_state = State::Error;
-            }
-        });
-    }
-};
-
-class BroadcastRelayToggleListItem : public tsl::elm::ToggleListItem {
-public:
-    BroadcastRelayToggleListItem() : ToggleListItem("Broadcast relay", false) {
-        u32 enabled;
-        Result rc;
-
-        rc = ldnMitmGetBroadcastRelay(&g_ldnConfig, &enabled);
-        if (R_FAILED(rc)) {
-            g_state = State::Error;
-        }
-
-        this->setState(enabled);
-
-        this->setStateChangedListener([](bool enabled) {
-            Result rc = ldnMitmSetBroadcastRelay(&g_ldnConfig, enabled);
-            if (R_FAILED(rc)) {
+        this->setStateChangedListener([set](bool enabled) {
+            if (R_FAILED(set(&g_ldnConfig, enabled))) {
                 g_state = State::Error;
             }
         });
@@ -114,14 +52,14 @@ public:
         } else if (g_state == State::Uninit) {
             list->addItem(new tsl::elm::ListItem("wrong state"));
         } else {
-            list->addItem(new EnabledToggleListItem());
-            list->addItem(new BroadcastRelayToggleListItem());
-            list->addItem(new LoggingToggleListItem());
+            list->addItem(new ConfigToggleListItem("Enabled", ldnMitmGetEnabled, ldnMitmSetEnabled));
+            list->addItem(new ConfigToggleListItem("Broadcast relay", ldnMitmGetBroadcastRelay, ldnMitmSetBroadcastRelay));
+            list->addItem(new ConfigToggleListItem("Logging", ldnMitmGetLogging, ldnMitmSetLogging));
 
-            /* Internet relay: on/off toggle + a picker of the servers listed
-               in /config/ldn_mitm/relay.cfg. Selecting one marks it active. */
+            /* Internet relay: on/off toggle + a picker of the servers in
+               relay.cfg. Selecting one marks it active. */
             list->addItem(new tsl::elm::CategoryHeader("Internet relay (cross-network play)"));
-            list->addItem(new InternetRelayToggleListItem());
+            list->addItem(new ConfigToggleListItem("Internet relay", ldnMitmGetInternetRelay, ldnMitmSetInternetRelay));
 
             g_serverItems.clear();
             u32 count = 0;
