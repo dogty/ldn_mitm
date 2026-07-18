@@ -6,7 +6,10 @@ include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../Atmosphere-libs/config
 #---------------------------------------------------------------------------------
 # version control constants
 #---------------------------------------------------------------------------------
-TARGET_VERSION := $(shell git describe --tags --dirty)
+# The Atmosphere-libs submodule intentionally diverges from the recorded
+# commit (the local tree carries the docs/ patch as commits), so submodule
+# state must not mark the build dirty - only real changes to this repo should.
+TARGET_VERSION := $(shell git describe --tags)$(shell git diff --quiet --ignore-submodules=all HEAD 2>/dev/null || echo -dirty)
 
 #---------------------------------------------------------------------------------
 # options for code generation
