@@ -45,14 +45,10 @@ int Pollable::Poll(Pollable *fds[], size_t nfds, int timeout) {
                 LogFormat("Poll: (POLLHUP/POLLNVAL) %zu(%d) revents=0x%x", i, pfd.fd, pfd.revents);
                 fds[i]->onClose();
             } else if (pfd.revents & POLLERR) {
-                /* Transient socket error, NOT a dead socket: on UDP this is
-                   typically an ICMP unreachable bounced off an earlier send
-                   (relay server briefly down, a departed peer). Closing here
-                   killed the relay transport for good on the first stray
-                   ICMP - the host silently stopped beaconing and became
-                   undiscoverable. Drain the error and keep the socket; a
-                   socket that is truly dead reports POLLHUP (also) or fails
-                   its next read, both of which still close it. */
+                /* Usually an ICMP-unreachable bounce, not a dead socket - drain
+                   SO_ERROR and keep it (closing here permanently killed the
+                   relay transport). A truly dead socket also reports POLLHUP or
+                   fails its next read. */
                 int soerr = 0;
                 socklen_t optlen = sizeof(soerr);
                 getsockopt(pfd.fd, SOL_SOCKET, SO_ERROR, &soerr, &optlen);

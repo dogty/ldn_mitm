@@ -62,12 +62,8 @@ namespace ams {
             .sb_efficiency = 4,
 
             .num_bsd_sessions = 3,
-            /* bsd:u. The relay socket reaches the internet by registering its
-               fd with an nifm request (see relay_client.cpp), not by service
-               type. (A bsd:s experiment for SOCK_RAW was tried and dropped:
-               raw egress never loops back locally on this stack, so the
-               receive path serves peer frames through the bsd:u RecvFrom
-               intercept instead - no raw socket needed.) */
+            /* bsd:u; the relay socket reaches the internet via nifm fd
+               registration (relay_client.cpp), not service type. */
             .bsd_service_type = BsdServiceType_User,
         };
 
@@ -95,14 +91,10 @@ namespace ams {
     namespace mitm {
 
         const s32 ThreadPriority = 6;
-        /* bsd:u has blocking commands (Recv/RecvFrom/Poll/Select/Accept). We
-           mitm bsd:u and forward those verbatim, which blocks the forwarding
-           thread inside the real service until it returns. A netplay game
-           keeps threads parked in blocking recv/poll, so with the old pool of
-           2 these were all consumed and no thread was left to accept the next
-           application's bsd:u session -> it hung at boot (blank screen, force
-           shutdown needed). Give the pool enough headroom that parked forwards
-           cannot starve session acceptance. */
+        /* Verbatim-forwarded bsd:u blocking commands (recv/poll/select) park a
+           pool thread inside the real service; a netplay game keeps several
+           parked, so a pool of 2 starved session acceptance and hung the next
+           launch. Size the pool with headroom. */
         const size_t TotalThreads = 8;
         const size_t NumExtraThreads = TotalThreads - 1;
         const size_t ThreadStackSize = 0x4000;
@@ -152,10 +144,9 @@ namespace ams {
                 static constexpr bool   CanManageMitmServers  = true;
             };
 
-            /* Two mitm ports now: ldn:u (sleepy) and bsd:u (busy - every
-               game's sockets). bsd:u needs many more concurrent sessions than
-               ldn ever did; undersizing would make us REFUSE bsd sessions and
-               break game networking outright. */
+            /* Two mitm ports: ldn:u and the busy bsd:u (every game's sockets).
+               bsd:u needs many more concurrent sessions or we would refuse
+               them and break networking. */
             enum PortIndex {
                 PortIndex_Ldn = 0,
                 PortIndex_Bsd = 1,
@@ -283,13 +274,10 @@ namespace ams {
            mode is off unless sdmc:/ldn_mitm_relay.cfg names a relay server. */
         mitm::ldn::relay::LoadConfig();
 
-        /* NOTE: an earlier attempt handled sleep proactively via a psc
-           PmModule (ending the session at sleep entry like real ldn).
-           Abandoned: every variant eventually left a psc request
-           unacknowledged around the suspend gap, spsm then failed its
-           sequence and omm ASSERTED (2165-0001) - an unwakeable console.
-           Sleep is instead detected reactively at wake via POLLHUP on the
-           dead sockets (see LDUdpSocket::onClose), which is proven safe. */
+        /* Do NOT handle sleep via a psc PmModule: an unacknowledged psc
+           request across the suspend gap asserts omm (2165-0001, unwakeable
+           console). Sleep is detected at wake via POLLHUP on the dead sockets
+           (LDUdpSocket::onClose). */
 
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,

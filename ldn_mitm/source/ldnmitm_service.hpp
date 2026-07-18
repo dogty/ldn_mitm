@@ -18,13 +18,10 @@ namespace ams::mitm::ldn {
             LdnMitMService(std::shared_ptr<::Service> &&s, const sm::MitmProcessInfo &c);
             
             static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
-                /* When ldn is turned off (Tesla overlay "Enabled"), stop
-                   intercepting *games'* ldn sessions entirely so they talk to
-                   the real ldn service - turning ldn off fully bypasses
-                   ldn_mitm (bsd does the same). Non-application processes (the
-                   Tesla overlay) are still mitm'd so the config service stays
-                   reachable to re-enable. NOTE: the decision is made when a
-                   game opens its ldn session, so toggle BEFORE launching. */
+                /* With ldn disabled, stop mitm'ing games entirely (real ldn
+                   takes over); non-applications (the Tesla overlay) stay mitm'd
+                   so the config service can re-enable. Decided at session open,
+                   so toggle before launching. */
                 const bool is_app = ncm::IsApplicationId(client_info.program_id);
                 const bool mitm = !is_app || LdnConfig::getEnabled();
                 LogFormat("should_mitm pid: %" PRIu64 " tid: %" PRIx64 " app %d -> %d",
