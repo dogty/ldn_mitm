@@ -256,6 +256,15 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::onSyncNetwork(NetworkInfo *info) {
         std::scoped_lock lock(this->dataMutex);
+        /* Accept network sync only for the network we are joining/joined. A
+           merely-scanning station (openStation, no connect yet) has
+           joinActive == false and is never flipped connected, and on a shared
+           relay another session's SyncNetwork (a different bssid) can never
+           overwrite our state. */
+        if (!this->joinActive || !(info->common.bssid == this->joinBssid)) {
+            LogFormat("onSyncNetwork: not for our target network, ignoring");
+            return;
+        }
         this->networkInfo = *info;
         if (this->state == CommState::Station) {
             this->setState(CommState::StationConnected);
@@ -662,16 +671,20 @@ namespace ams::mitm::ldn {
         this->networkInfo.ldn.nodeCount = count + 1;
 
         if (this->relay) {
-            /* Relay mode: stations joined over the relay (no per-station TCP
-               socket), so one broadcast reaches every station at once. */
+            /* Relay mode: stations joined over the relay have no per-station
+               TCP socket, so one broadcast reaches them all at once. */
             this->relay->send(LANPacketType::SyncNetwork, &this->networkInfo, sizeof(this->networkInfo));
-        } else {
-            for (auto &i : stations) {
-                if (i.getStatus() == NodeStatus::Connected) {
-                    int ret = i.sendPacket(LANPacketType::SyncNetwork, &this->networkInfo, sizeof(this->networkInfo));
-                    if (ret < 0) {
-                        LogFormat("Failed to sendTcp");
-                    }
+        }
+        /* Also sync every station that DOES hold a TCP socket. In pure local
+           mode that is all of them; in relay mode it is any same-LAN console
+           that joined over TCP (relay off on its end) - dropping this send is
+           what left such a joiner stuck waiting for SyncNetwork. Relay-only
+           stations have no socket (getFd() < 0) and are skipped here. */
+        for (auto &i : stations) {
+            if (i.getStatus() == NodeStatus::Connected && i.getFd() >= 0) {
+                int ret = i.sendPacket(LANPacketType::SyncNetwork, &this->networkInfo, sizeof(this->networkInfo));
+                if (ret < 0) {
+                    LogFormat("Failed to sendTcp");
                 }
             }
         }
@@ -739,17 +752,36 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::worker() {
         this->stop = false;
+        /* loopPoll() blocks up to the poll timeout (100ms default), so loop
+           iterations are ~100ms, not 1ms - a per-iteration counter would fire
+           the keepalive ~100x too slowly (every ~8min). Measure real elapsed
+           time instead so registration is refreshed well within the relay
+           server's idle timeout (60s). */
+        os::Tick last_beacon = os::GetSystemTick();
         while (!this->stop) {
 
             int rc = loopPoll();
             if (rc < 0) {
                 break;
             }
-            /* Keep our relay registration alive (~every 5s at 1ms/iter). */
             if (this->relay) {
-                if (++this->relayKeepaliveMs >= 5000) {
-                    this->relayKeepaliveMs = 0;
-                    this->relay->keepalive();
+                const os::Tick now = os::GetSystemTick();
+                if (os::ConvertToTimeSpan(now - last_beacon).GetMilliSeconds() >= RelayBeaconIntervalMs) {
+                    last_beacon = now;
+                    /* A host that is merely idling in a lobby (no station has
+                       joined yet) otherwise transmits nothing but the empty
+                       keepalive, which carries no source IP - so the relay
+                       server never learns its endpoint and a remote joiner's
+                       Scan is forwarded to nobody. Re-broadcast our network
+                       advertisement instead: it registers our source at the
+                       server AND lets remote consoles discover us proactively.
+                       Non-hosts just refresh their registration. */
+                    if (this->state == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->dataMutex);
+                        this->relay->send(LANPacketType::ScanResp, &this->networkInfo, sizeof(this->networkInfo));
+                    } else {
+                        this->relay->keepalive();
+                    }
                 }
             }
             /* Brief unlocked window so IPC threads can grab pollMutex;
@@ -909,6 +941,11 @@ namespace ams::mitm::ldn {
                 this->tcp->close();
             }
         }
+        {
+            /* No longer joined: stop accepting sync for the old network. */
+            std::scoped_lock lock(this->dataMutex);
+            this->joinActive = false;
+        }
         this->setState(CommState::Station);
 
         return 0;
@@ -965,6 +1002,11 @@ namespace ams::mitm::ldn {
             }
             this->resetStations();
         }
+        {
+            /* Browsing again, not joining any network yet: reject stray sync. */
+            std::scoped_lock lock(this->dataMutex);
+            this->joinActive = false;
+        }
 
         this->setState(CommState::Station);
 
@@ -1010,6 +1052,15 @@ namespace ams::mitm::ldn {
             }
         }
 
+        /* Record the target network so onSyncNetwork only accepts sync for it
+           (a shared relay carries other sessions' SyncNetwork to us too). Must
+           be set before Connect goes out so a fast reply is not rejected. */
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->joinBssid = networkInfo->common.bssid;
+            this->joinActive = true;
+        }
+
         /* Relay mode: the host's IP is a real address on another network,
            unroutable directly across the internet, so there is no TCP to it.
            Send Connect over the relay and wait for the host's SyncNetwork
@@ -1037,8 +1088,13 @@ namespace ams::mitm::ldn {
                 }
                 svcSleepThread(10000000L); /* 10ms */
             }
-            LogFormat("relay connect: no SyncNetwork from host, aborting");
-            return ResultConnectFailed;
+            /* No SyncNetwork over the relay. The host may be a local console
+               that is not on the relay (relay off there, or its relay open
+               failed), so fall through to a direct TCP join: on the same LAN
+               hostIp still reaches the host's TCP listener. If the host really
+               is remote, the TCP connect below times out and we fail as
+               before, just a few seconds later. */
+            LogFormat("relay connect: no SyncNetwork, falling back to direct TCP to %08x", hostIp);
         }
 
         struct sockaddr_in addr;
@@ -1293,11 +1349,19 @@ namespace ams::mitm::ldn {
             return rc;
         }
 
+        /* Latch the relay decision ONCE for this whole init. relay::IsEnabled()
+           is a live, overlay-toggleable atomic; reading it separately for the
+           nifm mode below and the transport open further down let a mid-init
+           toggle produce an inconsistent session (internet request with no
+           relay, or LocalNetworkMode with a relay socket that can't reach the
+           server). One read keeps them consistent. */
+        const bool use_relay = relay::IsEnabled();
+
         /* Relay mode keeps the console on the INTERNET (so the relay socket
            can reach the server), so skip LocalNetworkMode; the submitted
            request is then a plain internet request. Local mode is only for
            same-network LDN. */
-        if (!relay::IsEnabled()) {
+        if (!use_relay) {
             rc = nifmSetLocalNetworkMode(&request, true);
             if (R_FAILED(rc)) {
                 LogFormat("nifmSetLocalNetworkMode failed %x", rc);
@@ -1335,10 +1399,10 @@ namespace ams::mitm::ldn {
         }
 
         /* Phase 1b: open the relay transport so discovery crosses the relay.
-           Non-fatal if it fails - fall back to local-only discovery. */
-        if (relay::IsEnabled()) {
+           Non-fatal if it fails - fall back to local-only discovery. Uses the
+           same latched decision as the nifm mode above. */
+        if (use_relay) {
             this->relay = std::make_unique<RelayLanSocket>(this);
-            this->relayKeepaliveMs = 0;
             Result relay_rc = this->relay->open();
             if (R_FAILED(relay_rc)) {
                 LogFormat("LANDiscovery: relay open failed %x (local-only)", relay_rc);

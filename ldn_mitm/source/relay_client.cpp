@@ -38,6 +38,14 @@ namespace ams::mitm::ldn::relay {
         constexpr u8 TypeKeepalive = 0x00;
         constexpr u8 TypeIpv4      = 0x01;
 
+        /* Largest game/LAN payload we can wrap: the 1500-byte frame buffer
+           minus the 1-byte relay type, 20-byte IPv4 header and 8-byte UDP
+           header (1500 - 29). A full MTU-1500 datagram carries up to 1472
+           payload bytes, but 1472 would need a 1501-byte buffer; the games
+           that push near-MTU frames (pia titles) still fit under this. A
+           tighter cap silently dropped valid 1401-1471 byte datagrams. */
+        constexpr size_t MaxWrapPayload = 1500 - 1 - 20 - 8; /* 1471 */
+
         /* IPv4 header checksum (16-bit ones-complement over the header). */
         u16 IpChecksum(const u8 *d, size_t n) {
             u32 s = 0;
@@ -450,7 +458,7 @@ namespace ams::mitm::ldn::relay {
     }
 
     int RelayTransport::SendBroadcast(const void *lan_packet, size_t size) {
-        if (m_fd < 0 || size > 1400) {
+        if (m_fd < 0 || size > MaxWrapPayload) {
             return -1;
         }
         /* [0x01][IPv4(20) + UDP(8) + LANPacket] from vsrc -> 10.13.255.255. */
@@ -483,7 +491,7 @@ namespace ams::mitm::ldn::relay {
     }
 
     int RelayTransport::SendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip) {
-        if (m_fd < 0 || m_rsrc == 0 || len == 0 || len > 1400) {
+        if (m_fd < 0 || m_rsrc == 0 || len == 0 || len > MaxWrapPayload) {
             return -1;
         }
         /* [0x01][IPv4(20) + UDP(8) + game payload] from our REAL IP to dst_ip.
@@ -526,7 +534,7 @@ namespace ams::mitm::ldn::relay {
         const u16 dport = (udp[2] << 8) | udp[3];
         const u8 *payload = udp + 8;
         const size_t plen = (ip + iplen) - payload;
-        if (plen == 0 || plen > 1400) {
+        if (plen == 0 || plen > MaxWrapPayload) {
             return;
         }
         const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];

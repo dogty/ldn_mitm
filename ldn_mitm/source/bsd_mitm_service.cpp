@@ -76,39 +76,59 @@ namespace ams::mitm::ldn {
                 static_cast<long long>(in_data.tv_sec), static_cast<long long>(in_data.tv_usec));
         }
 
-        /* Re-issue with the capped timeout. Wire layout mirrors libnx
-           bsdSelect (cmd 5): 32-byte in-data, 3 AutoSelect-In + 3
-           AutoSelect-Out fd_set buffers (zero-sized when the game passed
-           NULL), out {ret, errno}. */
-        BsdSelectInData in = in_data;
-        in.is_null = 0;
-        in.tv_sec  = WaitCapMs / 1000;
-        in.tv_usec = 0;
-        BsdOutData out = {};
-
+        /* Re-issue in WaitCapMs slices (same rationale as Poll): a dead game
+           frees our thread within a slice, but a FINITE timeout is honored to
+           its real deadline instead of returning 0 events after one slice.
+           Infinite (is_null) returns after the first slice. Wire layout mirrors
+           libnx bsdSelect (cmd 5): 32-byte in-data, 3 AutoSelect-In + 3
+           AutoSelect-Out fd_set buffers (zero-sized when the game passed NULL),
+           out {ret, errno}. */
+        const bool finite = (in_data.is_null == 0);
+        s64 remaining = finite ? (static_cast<s64>(in_data.tv_sec) * 1000 + in_data.tv_usec / 1000) : 0;
         ::Service *fwd = this->m_forward_service.get();
-        R_TRY((serviceDispatchInOut(fwd, 5, in, out,
-            .buffer_attrs = {
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
-            },
-            .buffers = {
-                { rd_in.GetPointer(),  rd_in.GetSize()  },
-                { wr_in.GetPointer(),  wr_in.GetSize()  },
-                { ex_in.GetPointer(),  ex_in.GetSize()  },
-                { rd_out.GetPointer(), rd_out.GetSize() },
-                { wr_out.GetPointer(), wr_out.GetSize() },
-                { ex_out.GetPointer(), ex_out.GetSize() },
-            },
-        )));
+        for (;;) {
+            s64 slice = WaitCapMs;
+            if (finite && remaining < WaitCapMs) {
+                slice = remaining;
+            }
+            BsdSelectInData in = in_data;
+            in.is_null = 0;
+            in.tv_sec  = static_cast<s64>(slice / 1000);
+            in.tv_usec = static_cast<s64>((slice % 1000) * 1000);
+            BsdOutData out = {};
 
-        ret.SetValue(out.ret);
-        bsd_errno.SetValue(out.bsd_errno);
-        R_SUCCEED();
+            R_TRY((serviceDispatchInOut(fwd, 5, in, out,
+                .buffer_attrs = {
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                },
+                .buffers = {
+                    { rd_in.GetPointer(),  rd_in.GetSize()  },
+                    { wr_in.GetPointer(),  wr_in.GetSize()  },
+                    { ex_in.GetPointer(),  ex_in.GetSize()  },
+                    { rd_out.GetPointer(), rd_out.GetSize() },
+                    { wr_out.GetPointer(), wr_out.GetSize() },
+                    { ex_out.GetPointer(), ex_out.GetSize() },
+                },
+            )));
+
+            if (out.ret != 0 || !finite) {
+                ret.SetValue(out.ret);
+                bsd_errno.SetValue(out.bsd_errno);
+                R_SUCCEED();
+            }
+
+            remaining -= slice;
+            if (remaining <= 0) {
+                ret.SetValue(0);
+                bsd_errno.SetValue(out.bsd_errno);
+                R_SUCCEED();
+            }
+        }
     }
 
     Result BsdMitmService::Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out) {
@@ -145,10 +165,15 @@ namespace ams::mitm::ldn {
                         auto *pout = reinterpret_cast<struct pollfd *>(fds_out.GetPointer());
                         for (u32 i = 0; i < nfds; i++) {
                             if (pout[i].fd == gfd) {
-                                if ((pout[i].revents & POLLIN) == 0) {
-                                    pout[i].revents |= POLLIN;
+                                /* poll()'s return value counts fds with ANY
+                                   revents set. Only bump it when this fd had
+                                   none yet - if it already reported readiness
+                                   (e.g. POLLERR/POLLHUP) it is already counted,
+                                   and adding again returns N+1 for N ready fds. */
+                                if (pout[i].revents == 0) {
                                     out.ret += 1;
                                 }
+                                pout[i].revents |= POLLIN;
                                 break;
                             }
                         }
@@ -171,31 +196,56 @@ namespace ams::mitm::ldn {
             LogFormat("bsd Poll capped #%u nfds %u timeout %d", n, nfds, timeout);
         }
 
-        /* Re-issue with the capped timeout. Wire layout mirrors libnx bsdPoll
-           (cmd 6): in {u32 nfds, s32 timeout} - nfds is u32 on the wire,
-           verified against the installed libnx.a - one AutoSelect-In and one
-           AutoSelect-Out pollfd buffer, out {ret, errno}. */
-        const struct {
-            u32 nfds;
-            s32 timeout;
-        } in = { nfds, WaitCapMs };
-        BsdOutData out = {};
-
+        /* Re-issue in WaitCapMs slices so a dead game frees our thread within
+           a slice (the dispatch errors out once its session dies). For a FINITE
+           timeout > ForwardMaxMs keep slicing until the caller's real deadline,
+           so we never report "timed out" (ret 0) early - the confirmed bug was
+           returning after one 1s slice for a poll(..., 120000). An infinite
+           wait (timeout < 0) returns after the first slice as before, letting
+           the game re-poll. Wire layout mirrors libnx bsdPoll (cmd 6): in {u32
+           nfds, s32 timeout}, one AutoSelect-In + one AutoSelect-Out pollfd
+           buffer, out {ret, errno}. */
+        const bool finite = (timeout >= 0);
+        s64 remaining = timeout; /* ms; only used when finite */
         ::Service *fwd = this->m_forward_service.get();
-        R_TRY((serviceDispatchInOut(fwd, 6, in, out,
-            .buffer_attrs = {
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
-                SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
-            },
-            .buffers = {
-                { fds_in.GetPointer(),  fds_in.GetSize()  },
-                { fds_out.GetPointer(), fds_out.GetSize() },
-            },
-        )));
+        for (;;) {
+            s32 slice = WaitCapMs;
+            if (finite && remaining < WaitCapMs) {
+                slice = static_cast<s32>(remaining);
+            }
+            const struct {
+                u32 nfds;
+                s32 timeout;
+            } in = { nfds, slice };
+            BsdOutData out = {};
 
-        ret.SetValue(out.ret);
-        bsd_errno.SetValue(out.bsd_errno);
-        R_SUCCEED();
+            R_TRY((serviceDispatchInOut(fwd, 6, in, out,
+                .buffer_attrs = {
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                },
+                .buffers = {
+                    { fds_in.GetPointer(),  fds_in.GetSize()  },
+                    { fds_out.GetPointer(), fds_out.GetSize() },
+                },
+            )));
+
+            /* Events ready or an error: done. Infinite wait: return the (0)
+               result so the game re-polls, preserving teardown-friendliness. */
+            if (out.ret != 0 || !finite) {
+                ret.SetValue(out.ret);
+                bsd_errno.SetValue(out.bsd_errno);
+                R_SUCCEED();
+            }
+
+            remaining -= slice;
+            if (remaining <= 0) {
+                /* The caller's real timeout elapsed with no events. */
+                ret.SetValue(0);
+                bsd_errno.SetValue(out.bsd_errno);
+                R_SUCCEED();
+            }
+        }
     }
 
     Result BsdMitmService::RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr) {

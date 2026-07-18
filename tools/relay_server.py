@@ -7,7 +7,11 @@ console's sdmc:/config/ldn_mitm/relay.cfg and pick it in the Tesla overlay.
 
 It speaks lan-play's client<->server protocol: UDP, each datagram is
 [u8 type][payload].
-  type 0x00 KEEPALIVE  - empty; (re)learns the client's UDP endpoint
+  type 0x00 KEEPALIVE  - empty; refreshes the idle timer for every IP already
+                         learned from this endpoint. It carries no address, so
+                         it CANNOT learn a new mapping - a client must send at
+                         least one IPv4 frame (ldn_mitm re-broadcasts its
+                         advertisement periodically) before it is routable.
   type 0x01 IPV4       - payload is a bare IPv4 packet (IP header + L4 + data)
   (other types are ignored)
 
@@ -93,7 +97,11 @@ def main():
         msg_type, payload = data[0], data[1:]
 
         if msg_type == TYPE_KEEPALIVE:
-            # keep every IP this endpoint owns alive
+            # Refresh every IP already learned from this endpoint. A keepalive
+            # carries no address, so it can only refresh - never learn - a
+            # mapping; a still-idle but unlearned client stays unroutable until
+            # it sends an IPv4 frame (which ldn_mitm does via its periodic
+            # advertisement re-broadcast).
             for vsrc, (ep, _) in list(clients.items()):
                 if ep == addr:
                     clients[vsrc] = (ep, now)

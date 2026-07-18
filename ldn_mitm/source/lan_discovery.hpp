@@ -150,6 +150,10 @@ namespace ams::mitm::ldn {
     class LANDiscovery {
         public:
             static const int DefaultPort = 11452;
+            /* How often (ms) the relay worker re-announces itself to the relay
+               server. Must stay well under the server's idle timeout (60s) so
+               an idle host is never forgotten. */
+            static constexpr s64 RelayBeaconIntervalMs = 5000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
@@ -171,7 +175,6 @@ namespace ams::mitm::ldn {
             std::unique_ptr<LDTcpSocket> tcp;
             /* Phase 1b: present only in relay mode (relay::IsEnabled()). */
             std::unique_ptr<RelayLanSocket> relay;
-            u64 relayKeepaliveMs = 0;
             std::array<LanStation, StationCountMax> stations;
             std::array<NodeLatestUpdate, NodeCountMax> nodeChanges;
             std::array<u8, NodeCountMax> nodeLastStates;
@@ -181,6 +184,15 @@ namespace ams::mitm::ldn {
             bool stop;
             bool initialized;
             NetworkInfo networkInfo;
+            /* Station side: the network this console set out to join. A relay
+               server is shared by unrelated sessions, so SyncNetwork frames
+               from OTHER hosts reach us too; we accept network sync only while
+               joinActive and only when the frame's bssid matches joinBssid.
+               This also stops a still-scanning station (joinActive == false)
+               from being flipped StationConnected by a stray broadcast.
+               Guarded by dataMutex. */
+            MacAddress joinBssid{};
+            bool joinActive = false;
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;
