@@ -181,6 +181,12 @@ namespace ams::mitm::ldn {
                healthy sessions on jittery internet paths get torn down, lower
                for faster peer-loss detection. */
             static constexpr s64 RelayPeerTimeoutMs = 30000;
+            /* Minimum gap (ms) between relay advertisements (beacon or reply
+               to a Scan). The 5s beacon already reaches every relay client
+               proactively, so a Scan arriving just after one needs no extra
+               reply - without this, hosts answered every scanner's periodic
+               Scan on top of the beacon, doubling advertisement traffic. */
+            static constexpr s64 RelayAdvertiseMinIntervalMs = 2000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
@@ -228,6 +234,9 @@ namespace ams::mitm::ldn {
             os::Tick hostLastSeen = os::Tick(0);
             bool relayJoined = false;
             u32 relayJoinedIp = 0;
+            /* Host side: when we last advertised over the relay (worker beacon
+               or Scan reply), for the rate limit above. Guarded by dataMutex. */
+            os::Tick lastRelayAdvertise = os::Tick(0);
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;

@@ -143,8 +143,16 @@ namespace ams::mitm::ldn {
                 case LANPacketType::Scan: {
                     if (this->discovery->getState() == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->discovery->dataMutex);
-                        this->sendPacket(LANPacketType::ScanResp, &this->discovery->networkInfo, sizeof(NetworkInfo));
-                        LogFormat("relay: Scan -> replied ScanResp");
+                        /* The 5s worker beacon already advertises us to every
+                           relay client; only reply if the scanner just missed
+                           one, so scanners don't double our advertisement
+                           traffic with their periodic Scans. */
+                        const os::Tick now = os::GetSystemTick();
+                        if (os::ConvertToTimeSpan(now - this->discovery->lastRelayAdvertise).GetMilliSeconds() >= LANDiscovery::RelayAdvertiseMinIntervalMs) {
+                            this->discovery->lastRelayAdvertise = now;
+                            this->sendPacket(LANPacketType::ScanResp, &this->discovery->networkInfo, sizeof(NetworkInfo));
+                            LogFormat("relay: Scan -> replied ScanResp");
+                        }
                     }
                     break;
                 }
@@ -823,6 +831,7 @@ namespace ams::mitm::ldn {
                        Non-hosts just refresh their registration. */
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
+                        this->lastRelayAdvertise = now;
                         this->relay->send(LANPacketType::ScanResp, &this->networkInfo, sizeof(this->networkInfo));
                     } else if (this->state == CommState::StationConnected && this->relayJoined) {
                         /* Connected over the relay: heartbeat so the host can
