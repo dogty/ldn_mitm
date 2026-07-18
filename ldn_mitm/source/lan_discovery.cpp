@@ -700,7 +700,15 @@ namespace ams::mitm::ldn {
                 static_cast<int>(copy));
 
             if (copy) {
-                pOutNetwork[i++] = info;
+                /* Skip a result whose host node has no username yet: the
+                   NetworkInfo arrived before the host finished populating it
+                   (a scan/sync timing race), and surfacing it makes the game
+                   try to join a not-ready network. */
+                if (info.ldn.nodes[0].userName[0] != 0) {
+                    pOutNetwork[i++] = info;
+                } else {
+                    LogFormat("scan: skipping result with empty username (not synced yet)");
+                }
             }
         }
         *count = i;
