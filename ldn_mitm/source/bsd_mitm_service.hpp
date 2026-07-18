@@ -23,9 +23,8 @@
 
 namespace ams::mitm::ldn {
 
-    /* mitm of bsd:u. See docs/bsd-mitm-plan.md. Phase 1: passive observer -
-       SendTo only logs broadcast-destined datagrams and forwards everything
-       unchanged. Fan-out (broadcast -> per-peer unicast) is Phase 2. */
+    /* mitm of bsd:u: broadcast->unicast fan-out and internet-relay of game
+       session traffic. See docs/bsd-mitm-plan.md. */
     class BsdMitmService : public sf::MitmServiceImplBase {
         public:
             BsdMitmService(std::shared_ptr<::Service> &&s, const sm::MitmProcessInfo &c)
@@ -35,22 +34,15 @@ namespace ams::mitm::ldn {
                     c.process_id, c.program_id);
             }
 
-            /* Logged so a capture across an app switch shows whether the
-               forward session actually closes when the game exits (thread /
-               session leak diagnosis). */
+            /* Logged to confirm the forward session closes on game exit. */
             ~BsdMitmService() {
                 LogFormat("~BsdMitmService pid: %" PRIu64, this->m_client_info.process_id);
             }
 
-            /* Only mitm real games. bsd is the busiest service on the system;
-               never touch sysmodules (and never ldn_mitm's own sockets), so a
-               bug here can only affect application networking, not the OS.
-               Also require ldn to be enabled (Tesla overlay): the bsd mitm
-               only exists to serve the broadcast/internet relay, so with ldn
-               off there is nothing for it to do - leave bsd alone entirely,
-               and turning ldn off in the overlay then fully bypasses ldn_mitm.
-               Decision is made at bsd-session open, so toggle before
-               launching the game. */
+            /* Only mitm real applications with ldn enabled; never sysmodules or
+               our own sockets. With ldn off the relay has nothing to do, so
+               leaving bsd alone fully bypasses ldn_mitm. Decided at bsd-session
+               open, so toggle before launching the game. */
             static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
                 const bool mitm = ncm::IsApplicationId(client_info.program_id) && LdnConfig::getEnabled();
                 LogFormat("bsd should_mitm pid: %" PRIu64 " tid: %" PRIx64 " -> %d",
@@ -64,9 +56,7 @@ namespace ams::mitm::ldn {
                leave a request parked on the real bsd:u forever. */
             Result Select(sf::Out<s32> ret, sf::Out<s32> bsd_errno, BsdSelectInData in_data, sf::InAutoSelectBuffer rd_in, sf::InAutoSelectBuffer wr_in, sf::InAutoSelectBuffer ex_in, sf::OutAutoSelectBuffer rd_out, sf::OutAutoSelectBuffer wr_out, sf::OutAutoSelectBuffer ex_out);
             Result Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out);
-            /* Receive-path intercept for internet-relay session traffic
-               (docs/internet-relay-plan.md option a). Step 1 lands this as a
-               pure pass-through to validate the wire signature on hardware. */
+            /* Serves relay-queued peer frames with the peer's real source. */
             Result RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr);
             Result SendTo(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, sf::InAutoSelectBuffer message, sf::InAutoSelectBuffer dst_addr);
     };

@@ -20,12 +20,10 @@
 
 namespace ams::mitm::ldn {
 
-    /* Shared, in-process handoff from LANDiscovery (the LDN session) to the
-       bsd:u mitm (the socket path). LANDiscovery publishes the current peer
-       set; the bsd handler reads a snapshot to convert LDN broadcast sends
-       into per-peer unicast. Guarded by its own mutex so the bsd hot path
-       never touches LANDiscovery's data/poll mutexes (no lock-order coupling
-       between the two services). All IPs are host byte order. */
+    /* In-process handoff from LANDiscovery to the bsd:u mitm: LANDiscovery
+       publishes the current peer set, the bsd handler snapshots it to convert
+       broadcast sends into per-peer unicast. Own mutex - no lock-order
+       coupling with LANDiscovery. IPs host byte order. */
     class SessionRegistry {
         public:
             static constexpr int MaxPeers = 8;
@@ -48,15 +46,11 @@ namespace ams::mitm::ldn {
             static void Get(Snapshot *out);
     };
 
-    /* Internet-relay receive queue (docs/internet-relay-plan.md option a).
-       The relay worker pushes game session frames received from remote peers;
-       the bsd:u mitm's RecvFrom handler pops them and serves them to the game
-       with the peer's real source address, and its Poll handler reports the
-       game socket readable while the queue is non-empty. This bypasses the
-       network stack entirely for delivery (the stack does not loop back raw
-       sends, and a dgram to our own IP would carry our own source), so it is
-       the only way to give the game the peer's source IP. Mutex-guarded;
-       independent of SessionRegistry's mutex. */
+    /* Internet-relay receive queue (docs/internet-relay-plan.md option a): the
+       relay worker pushes peer game frames, the bsd:u RecvFrom pops them and
+       serves them with the peer's real source address (the local stack can't
+       deliver a spoofed source, so this bypasses it), and Poll reports the
+       game socket readable while non-empty. Own mutex. */
     class GameRx {
         public:
             static constexpr int  MaxEntries = 32;
@@ -68,12 +62,12 @@ namespace ams::mitm::ldn {
             static s32  GameFd();
 
             /* Relay worker: enqueue a peer game frame. src_ip/ports host order.
-               Drops the oldest entry if full. No-op if no game fd is known. */
+               Drops the oldest entry if full. */
             static void Push(u32 src_ip, u16 sport, u16 dport, const void *data, size_t len);
 
             /* bsd RecvFrom handler: dequeue the oldest frame. Returns false if
                empty. Copies up to max_len bytes; out_len is the real length. */
-            static bool Pop(u32 *src_ip, u16 *sport, u16 *dport, void *out, size_t max_len, size_t *out_len);
+            static bool Pop(u32 *src_ip, u16 *sport, void *out, size_t max_len, size_t *out_len);
 
             /* Destination port of the oldest queued frame (host order), or 0
                if the queue is empty. Used to verify a socket's bound port

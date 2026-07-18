@@ -19,14 +19,10 @@
 
 namespace ams::mitm::ldn {
 
-    /* Wire image of libnx bsdSelect's in-data:
-         struct { int nfds; BsdSelectTimeval timeout; }
-       where BsdSelectTimeval = { struct timeval tv; bool is_null; }.
-       On this toolchain timeval is { s64 tv_sec; s64 tv_usec; } (time_t and
-       suseconds_t are both 64-bit), giving the 32-byte layout below. Verified
-       by disassembling bsdSelect in the installed libnx.a: nfds at +0, tv at
-       +8..+24, is_null at +24. Declared as a single struct so the sf raw-data
-       packer cannot reorder or re-pad the fields. */
+    /* Wire image of libnx bsdSelect's in-data: { s32 nfds; timeval{s64 tv_sec;
+       s64 tv_usec}; u8 is_null } = 32 bytes, nfds at +0, tv at +8, is_null at
+       +24 (verified against libnx). One struct so the sf packer can't
+       reorder/re-pad it. */
     struct BsdSelectInData {
         s32 nfds;
         u32 _pad;
@@ -42,22 +38,15 @@ namespace ams::mitm::ldn {
 }
 
 /* bsd:u mitm. Overridden commands:
+   - SendTo (11): broadcast fan-out / relay.
+   - Poll (6) / Select (5): unbounded waits are re-issued with a capped
+     timeout - a verbatim forward would pin the real bsd:u session if the game
+     dies mid-wait, hanging the next launch (see docs/HANDOFF.md #4). Bounded
+     waits are forwarded verbatim.
+   - RecvFrom (9): serve relay peer frames.
+   Every other command is forwarded verbatim by the mitm framework.
 
-   - SendTo (11): broadcast -> per-peer unicast fan-out (the relay).
-   - Poll (6) / Select (5): bounded-wait fix. A game thread parked in an
-     unbounded poll/select is forwarded synchronously, so *our* server thread
-     sits in svcSendSyncRequest against the real bsd:u. If the game exits
-     while we wait, the in-flight request pins the forward session forever,
-     the next app cannot get a bsd:u session, and the console hangs at the
-     next launch (see docs/HANDOFF.md #4). The overrides re-issue unbounded
-     waits with a capped timeout so every forwarded call returns in bounded
-     time. Bounded waits are forwarded verbatim.
-
-   Every other command is not listed here and is forwarded verbatim to the
-   real bsd service by the libstratosphere mitm framework.
-
-   Wire layouts (from libnx nx/source/services/bsd.c, cross-checked against
-   the installed libnx.a disassembly - note nfds is u32, NOT u64):
+   Wire layouts (libnx nx/source/services/bsd.c; note nfds is u32, NOT u64):
      Select (5): in { s32 nfds; BsdSelectInData-style timeout; } (32 bytes)
                  buffers: AutoSelect-In rd/wr/ex, AutoSelect-Out rd/wr/ex
      Poll   (6): in { u32 nfds; s32 timeout; }

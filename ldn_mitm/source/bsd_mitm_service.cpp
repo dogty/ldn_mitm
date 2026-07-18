@@ -29,16 +29,10 @@ namespace ams::mitm::ldn {
 
     namespace {
 
-        /* Bounded-wait policy for Poll/Select (the forward-session leak fix,
-           docs/HANDOFF.md #4). Waits up to ForwardMaxMs are forwarded
-           verbatim: they return by themselves, so they can only delay - never
-           leak - the session teardown, and the verbatim path has no
-           marshalling of our own. Anything longer (or infinite) is re-issued
-           with WaitCapMs instead: the real service still returns the moment
-           events fire, so latency is unaffected; if nothing fires we return 0
-           events early, which the game handles by re-polling. The payoff:
-           when the game dies mid-wait, our thread returns within WaitCapMs,
-           the session destructs, and the real bsd:u session is freed. */
+        /* Poll/Select bounded-wait policy (docs/HANDOFF.md #4): waits <=
+           ForwardMaxMs are forwarded verbatim; longer/infinite waits are
+           re-issued in WaitCapMs slices so a game dying mid-wait frees our
+           thread (an in-flight forward would pin the real bsd:u session). */
         constexpr s32 WaitCapMs    = 1000;
         constexpr s32 ForwardMaxMs = 60000;
 
@@ -48,19 +42,16 @@ namespace ams::mitm::ldn {
             s32 bsd_errno;
         };
 
-        /* Rate-limited logging: capped re-polls recur every WaitCapMs for as
-           long as a game thread sits in an idle poll(-1), which would flood
-           the log. Log the first few (proof the path fires), then sample. */
+        /* Log the first few capped re-polls, then sample, to avoid flooding
+           when a game thread sits in an idle poll(-1). */
         bool ShouldLogCapped(u32 n) {
             return n <= 8 || (n % 256) == 0;
         }
 
         /* getsockname (bsd cmd 16) on the forward session: the local port a
-           socket is bound to. Wire layout verified against the local libnx
-           source (bsd.c: _bsdCmdInSockfdOutSockaddr, in = int sockfd, out =
-           { int ret; int errno_; } + socklen_t addrlen, one
-           HipcAutoSelect|Out sockaddr buffer) and its disassembly in the
-           installed libnx.a. Returns false on any failure. */
+           socket is bound to. Wire (libnx bsd.c): in { s32 sockfd }, out
+           { s32 ret; s32 errno; u32 addrlen }, one AutoSelect-Out sockaddr.
+           False on any failure. */
         bool GetForwardBoundPort(::Service *fwd, s32 sockfd, u16 *out_port) {
             struct sockaddr_in sa = {};
             const struct { s32 sockfd; } in = { sockfd };
@@ -97,13 +88,10 @@ namespace ams::mitm::ldn {
                 static_cast<long long>(in_data.tv_sec), static_cast<long long>(in_data.tv_usec));
         }
 
-        /* Re-issue in WaitCapMs slices (same rationale as Poll): a dead game
-           frees our thread within a slice, but a FINITE timeout is honored to
-           its real deadline instead of returning 0 events after one slice.
-           Infinite (is_null) returns after the first slice. Wire layout mirrors
-           libnx bsdSelect (cmd 5): 32-byte in-data, 3 AutoSelect-In + 3
-           AutoSelect-Out fd_set buffers (zero-sized when the game passed NULL),
-           out {ret, errno}. */
+        /* Re-issue in WaitCapMs slices; honor a FINITE timeout to its real
+           deadline, return after one slice when infinite (is_null). Wire
+           mirrors libnx bsdSelect (cmd 5): 32-byte in-data, 3 AutoSelect-In +
+           3 AutoSelect-Out fd_sets, out {ret, errno}. */
         const bool finite = (in_data.is_null == 0);
         s64 remaining = finite ? (static_cast<s64>(in_data.tv_sec) * 1000 + in_data.tv_usec / 1000) : 0;
         ::Service *fwd = this->m_forward_service.get();
@@ -153,12 +141,10 @@ namespace ams::mitm::ldn {
     }
 
     Result BsdMitmService::Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out) {
-        /* Wake for a queued relay frame: if we have game data and the game is
-           polling its session socket, re-poll immediately (timeout 0) to get
-           real readiness for the other fds, then force POLLIN on the game fd
-           so the game proceeds to RecvFrom (where we serve the queued frame).
-           Without this the real socket is never readable - peer traffic comes
-           via the relay, not the socket - so the game would never recv. */
+        /* Queued relay frame + game polling its session fd: re-poll with
+           timeout 0 for real readiness on the other fds, then force POLLIN on
+           the game fd so it proceeds to RecvFrom. Peer traffic arrives via the
+           relay, never the socket, so the game would otherwise never recv. */
         if (relay::IsEnabled() && GameRx::HasData()) {
             const s32 gfd = GameRx::GameFd();
             const size_t need = static_cast<size_t>(nfds) * sizeof(struct pollfd);
@@ -186,11 +172,9 @@ namespace ams::mitm::ldn {
                         auto *pout = reinterpret_cast<struct pollfd *>(fds_out.GetPointer());
                         for (u32 i = 0; i < nfds; i++) {
                             if (pout[i].fd == gfd) {
-                                /* poll()'s return value counts fds with ANY
-                                   revents set. Only bump it when this fd had
-                                   none yet - if it already reported readiness
-                                   (e.g. POLLERR/POLLHUP) it is already counted,
-                                   and adding again returns N+1 for N ready fds. */
+                                /* poll() counts fds with any revents set: only
+                                   bump when this fd had none, else it is already
+                                   counted. */
                                 if (pout[i].revents == 0) {
                                     out.ret += 1;
                                 }
@@ -217,15 +201,11 @@ namespace ams::mitm::ldn {
             LogFormat("bsd Poll capped #%u nfds %u timeout %d", n, nfds, timeout);
         }
 
-        /* Re-issue in WaitCapMs slices so a dead game frees our thread within
-           a slice (the dispatch errors out once its session dies). For a FINITE
-           timeout > ForwardMaxMs keep slicing until the caller's real deadline,
-           so we never report "timed out" (ret 0) early - the confirmed bug was
-           returning after one 1s slice for a poll(..., 120000). An infinite
-           wait (timeout < 0) returns after the first slice as before, letting
-           the game re-poll. Wire layout mirrors libnx bsdPoll (cmd 6): in {u32
-           nfds, s32 timeout}, one AutoSelect-In + one AutoSelect-Out pollfd
-           buffer, out {ret, errno}. */
+        /* Re-issue in WaitCapMs slices; a FINITE timeout > ForwardMaxMs runs to
+           its real deadline (never report 0 events early), infinite (timeout <
+           0) returns after one slice so the game re-polls. Wire mirrors libnx
+           bsdPoll (cmd 6): in {u32 nfds, s32 timeout}, AutoSelect-In/Out pollfd
+           buffers, out {ret, errno}. */
         const bool finite = (timeout >= 0);
         s64 remaining = timeout; /* ms; only used when finite */
         ::Service *fwd = this->m_forward_service.get();
@@ -270,28 +250,19 @@ namespace ams::mitm::ldn {
     }
 
     Result BsdMitmService::RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr) {
-        /* Serve a relay-received peer frame with the peer's REAL source
-           address, if one is queued for this game socket. Bypasses the network
-           stack (which cannot deliver a spoofed source locally). Otherwise
-           forward verbatim - non-game sockets and the empty-queue case behave
-           exactly as before, so unrelated recv traffic is untouched. */
+        /* Serve a queued relay peer frame with the peer's real source address
+           (the stack can't deliver a spoofed source locally). Otherwise
+           forward verbatim, leaving unrelated recv traffic untouched. */
         if (relay::IsEnabled() &&
             (flags & MSG_PEEK) == 0 &&               /* don't consume on a peek */
             src_addr.GetSize() >= sizeof(struct sockaddr_in) &&
             GameRx::HasData()) {                     /* peer frames are waiting */
 
-            /* Bootstrap the game socket fd from the receive side: a recv while
-               peer frames are queued is the game waiting on its session socket
-               (the joiner never broadcasts first, so SendTo can't record it).
-               HasData() is only true during an active relay session, so this
-               cannot mis-fire for unrelated games.
-               A game can run several UDP sockets (a second pia socket, voice,
-               a discovery port); whichever recv'd FIRST used to get latched,
-               and a wrong latch misrouted relay traffic until teardown. Ask
-               the real bsd which local port this socket is bound to and latch
-               only when it matches the queued frame's destination port; on
-               any mismatch or getsockname failure, forward verbatim - the
-               real session socket will come along and match. */
+            /* Latch the game fd from the receive side (a joiner never
+               broadcasts first, so SendTo can't record it) - but only when
+               this socket's bound port matches the queued frame's dst port, so
+               a second game socket (voice, discovery) is never mis-latched. On
+               any mismatch or getsockname failure, forward verbatim. */
             if (GameRx::GameFd() < 0) {
                 u16 bound_port = 0;
                 if (GetForwardBoundPort(this->m_forward_service.get(), sockfd, std::addressof(bound_port)) &&
@@ -308,19 +279,16 @@ namespace ams::mitm::ldn {
                 R_RETURN(sm::mitm::ResultShouldForwardToSession());
             }
 
+            /* Pop straight into the IPC buffer: Pop already clamps to max_len. */
             u32 src_ip = 0; u16 sport = 0; size_t out_len = 0;
-            u8 tmp[GameRx::MaxPayload];
-            if (GameRx::Pop(&src_ip, &sport, nullptr, tmp, sizeof(tmp), &out_len)) {
-                const size_t n = out_len < message.GetSize() ? out_len : message.GetSize();
-                std::memcpy(message.GetPointer(), tmp, n);
-
+            if (GameRx::Pop(&src_ip, &sport, message.GetPointer(), message.GetSize(), &out_len)) {
                 struct sockaddr_in sa = {};
                 sa.sin_family = AF_INET;
                 sa.sin_port = htons(sport);
                 sa.sin_addr.s_addr = htonl(src_ip);
                 std::memcpy(src_addr.GetPointer(), std::addressof(sa), sizeof(sa));
 
-                ret.SetValue(static_cast<s32>(n));
+                ret.SetValue(static_cast<s32>(out_len));
                 bsd_errno.SetValue(0);
                 addrlen.SetValue(static_cast<u32>(sizeof(sa)));
 
@@ -334,11 +302,10 @@ namespace ams::mitm::ldn {
     Result BsdMitmService::SendTo(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, sf::InAutoSelectBuffer message, sf::InAutoSelectBuffer dst_addr) {
         AMS_UNUSED(ret, bsd_errno);
 
-        /* Two independent consumers of the game's sends: the LAN broadcast
-           fan-out (broadcast->unicast for WiFi reliability) and the internet
-           relay (carry session traffic to peers on other networks). Enter if
-           either is active; the internet relay is NOT gated on the broadcast
-           relay toggle. Anything else falls straight through. */
+        /* Two consumers of the game's sends: LAN broadcast fan-out
+           (broadcast->unicast for WiFi reliability) and the internet relay.
+           Enter if either is active; the relay is not gated on the fan-out
+           toggle. */
         const bool want_fanout = LdnConfig::getBroadcastRelay();
         const bool want_relay  = relay::IsEnabled();
         if ((want_fanout || want_relay) && dst_addr.GetSize() >= sizeof(struct sockaddr_in)) {
@@ -352,10 +319,9 @@ namespace ams::mitm::ldn {
 
                 const bool is_bcast = (ip == 0xFFFFFFFFu) || (snap.active && ip == snap.bcast_ip);
 
-                /* Internet relay, unicast: some games broadcast only a brief
-                   handshake, then switch to unicast to the peer's IP (from
-                   NodeInfo) - unroutable across the internet, so relay it; the
-                   relay routes a unicast frame to the client owning that dst. */
+                /* Internet relay, unicast: games that switch from a broadcast
+                   handshake to unicast target a peer IP unroutable across the
+                   internet, so relay it (routed to the client owning that dst). */
                 if (want_relay && snap.active && !is_bcast && ip != 0 && ip != 0x7F000001u) {
                     for (int i = 0; i < snap.peer_count; i++) {
                         if (ip == snap.peer_ips[i]) {
@@ -367,12 +333,11 @@ namespace ams::mitm::ldn {
                 }
 
                 if (snap.active && snap.peer_count > 0 && is_bcast) {
-                    /* LAN broadcast fan-out: deliver a unicast copy to each
-                       known peer. WiFi delivers unicast reliably (ACKed,
-                       full-rate, no DTIM) unlike the AP's lossy broadcast
-                       re-flood. The original broadcast is still forwarded
-                       below, so SendTo semantics stay exact and unknown peers
-                       remain covered; duplicates are harmless here. */
+                    /* LAN broadcast fan-out: unicast a copy to each peer (WiFi
+                       unicast is ACKed/full-rate, the AP's broadcast re-flood
+                       is lossy). The original broadcast is still forwarded
+                       below, so unknown peers stay covered and duplicates are
+                       harmless. */
                     if (want_fanout) {
                         ::Service *fwd = this->m_forward_service.get();
                         for (int i = 0; i < snap.peer_count; i++) {
@@ -380,12 +345,10 @@ namespace ams::mitm::ldn {
                             peer.sin_addr.s_addr = htonl(snap.peer_ips[i]);
 
                             const struct { s32 sockfd; s32 flags; } in = { sockfd, flags };
-                            struct { s32 ret; s32 bsd_errno; } out = {};
+                            BsdOutData out = {};
 
-                            /* Mirrors libnx bsdSendTo (cmd 11): in {sockfd,flags},
-                               two AutoSelect-In buffers (payload, sockaddr), out
-                               {ret,errno}. Issued on the game's forward session
-                               so its fd table applies. Best-effort. */
+                            /* libnx bsdSendTo (cmd 11), on the game's forward
+                               session. Best-effort. */
                             serviceDispatchInOut(fwd, 11, in, out,
                                 .buffer_attrs = {
                                     SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
@@ -399,9 +362,9 @@ namespace ams::mitm::ldn {
                         }
                     }
 
-                    /* Internet relay, broadcast: carry it to peers on other
-                       networks (their real IPs are unroutable here), and record
-                       the game's session fd for the RecvFrom/Poll intercept. */
+                    /* Internet relay, broadcast: carry it to remote peers and
+                       record the game's session fd for the RecvFrom/Poll
+                       intercept. */
                     if (want_relay) {
                         GameRx::SetGameFd(sockfd);
                         relay::BridgeSendGameBroadcast(message.GetPointer(), message.GetSize(), port);

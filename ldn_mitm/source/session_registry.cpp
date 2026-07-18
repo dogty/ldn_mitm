@@ -85,16 +85,15 @@ namespace ams::mitm::ldn {
             return;
         }
         std::scoped_lock lk(g_rx_mutex);
-        /* Enqueue even before the game socket fd is known: on the JOINER the
-           game does not broadcast (so SendTo never records the fd) until it
-           has received the host's traffic - a deadlock if Push required the
-           fd. Queuing makes HasData() true, which lets RecvFrom bootstrap the
-           fd from the game's own recv and drain us. */
+        /* Enqueue even before the game fd is known: the joiner doesn't
+           broadcast (so SendTo never records the fd) until it has received
+           host traffic. Queuing makes HasData() true so RecvFrom can bootstrap
+           the fd from the game's own recv. */
         int slot;
         if (g_rx_count == MaxEntries) {
             /* full: drop oldest (advance head), reuse its slot at the tail */
+            slot = g_rx_head;
             g_rx_head = (g_rx_head + 1) % MaxEntries;
-            slot = (g_rx_head + g_rx_count - 1) % MaxEntries;
         } else {
             slot = (g_rx_head + g_rx_count) % MaxEntries;
             g_rx_count++;
@@ -107,7 +106,7 @@ namespace ams::mitm::ldn {
         std::memcpy(e.data, data, len);
     }
 
-    bool GameRx::Pop(u32 *src_ip, u16 *sport, u16 *dport, void *out, size_t max_len, size_t *out_len) {
+    bool GameRx::Pop(u32 *src_ip, u16 *sport, void *out, size_t max_len, size_t *out_len) {
         std::scoped_lock lk(g_rx_mutex);
         if (g_rx_count == 0) {
             return false;
@@ -117,7 +116,6 @@ namespace ams::mitm::ldn {
         std::memcpy(out, e.data, n);
         if (src_ip)  { *src_ip = e.src_ip; }
         if (sport)   { *sport = e.sport; }
-        if (dport)   { *dport = e.dport; }
         if (out_len) { *out_len = n; }
         g_rx_head = (g_rx_head + 1) % MaxEntries;
         g_rx_count--;
