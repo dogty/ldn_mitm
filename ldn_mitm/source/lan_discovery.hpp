@@ -153,7 +153,10 @@ namespace ams::mitm::ldn {
             bool isReady() const { return this->transport.IsOpen(); }
             int getFd() override { return this->transport.GetFd(); }
             int onRead() override;
-            void onClose() override {}
+            /* Close the transport so a HUP'd relay socket (sleep/wake, wifi
+               loss) leaves the poll set instead of spinning the worker; the
+               fd goes to -1 and later sends fail harmlessly. */
+            void onClose() override { this->transport.Close(); }
             void keepalive() { this->transport.SendKeepalive(); }
             /* Broadcast a LANPacket (Connect/SyncNetwork) over the relay.
                Relay sends are always broadcasts (sendto ignores the addr), so

@@ -102,6 +102,11 @@ namespace ams::mitm::ldn {
     }
 
     void LDUdpSocket::onClose() {
+        /* Take the dead socket out of the poll set (same rationale as
+           LDTcpSocket::onClose): after a sleep/wake or wifi loss every socket
+           reports POLLHUP forever, and leaving the fd in the set spins the
+           worker in Poll->onClose at full speed until the game finalizes. */
+        this->close();
         discovery->disconnect_reason = DisconnectReason::SignalLost;
         discovery->setState(CommState::Error);
     };
