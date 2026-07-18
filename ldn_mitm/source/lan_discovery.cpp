@@ -105,13 +105,39 @@ namespace ams::mitm::ldn {
         /* Take the dead socket out of the poll set (same rationale as
            LDTcpSocket::onClose): after a sleep/wake or wifi loss every socket
            reports POLLHUP forever, and leaving the fd in the set spins the
-           worker in Poll->onClose at full speed until the game finalizes. */
+           worker in Poll->onClose at full speed until the game finalizes.
+           The discovery udp socket only dies with its interface (airplane
+           mode, wifi loss), so mark the session for a rebuild: once the
+           network is back and the game re-enters its host/join menu,
+           refreshNetworkSession() re-creates everything - no game relaunch.
+           Reason: interface death is a SYSTEM-initiated end from the game's
+           point of view - pia classifies airplane mode (2618-0313) right
+           next to sleep (2618-0314), and reporting SignalLost here instead
+           sent AC into its generic-failure cascade (2123-0011...). Keep
+           SignalLost for actual peer loss (TCP close / relay timeout). */
         this->close();
-        discovery->disconnect_reason = DisconnectReason::SignalLost;
-        discovery->setState(CommState::Error);
+        discovery->needsReinit = true;
+        /* Keep the FIRST recorded cause: if the session already ended (sleep
+           teardown, or the other socket's close), don't rewrite the reason. */
+        if (discovery->getState() != CommState::Error) {
+            discovery->disconnect_reason =
+                (discovery->getState() == CommState::AccessPointCreated)
+                    ? DisconnectReason::DestroyedBySystem
+                    : DisconnectReason::DisconnectedBySystem;
+            discovery->setState(CommState::Error);
+        }
     };
 
     /* --- RelayLanSocket (Phase 1b step 2): LDN discovery over the relay --- */
+
+    void RelayLanSocket::onClose() {
+        /* The relay transport only HUPs when its interface dies (airplane
+           mode, wifi loss, or waking from sleep).
+           Close it and mark the session for rebuild so relay play recovers
+           on the next host/join without relaunching the game. */
+        this->transport.Close();
+        this->discovery->needsReinit = true;
+    }
 
     ssize_t RelayLanSocket::recvfrom(void *buf, size_t len, struct sockaddr_in *addr) {
         u32 src = 0;
@@ -1057,20 +1083,22 @@ namespace ams::mitm::ldn {
         return 0;
     }
 
-    Result LANDiscovery::refreshRelayMode() {
+    Result LANDiscovery::refreshNetworkSession() {
         /* The relay decision is latched at initialize(): it selects the nifm
            request mode (plain internet vs LocalNetworkMode) AND whether the
            relay transport opens, so a live toggle cannot simply open a
            socket later. The game only reaches openAccessPoint/openStation
            from its host/join menus - never mid-session - so if the overlay
-           toggle changed since the latch, rebuild the whole network session
-           in the right mode. Users no longer need to relaunch the game after
-           flipping the internet relay. */
-        if (!this->initialized || this->initRelay == relay::IsEnabled()) {
+           toggle changed since the latch (or the session was gutted by a
+           sleep/wake, via the HUP closes), rebuild the whole network session in
+           the right mode. Users don't need to relaunch the game. */
+        const bool relay_changed = this->initRelay != relay::IsEnabled();
+        if (!this->initialized || (!relay_changed && !this->needsReinit)) {
             return 0;
         }
-        LogFormat("relay toggle changed (%d -> %d): reinitializing network session",
-            static_cast<int>(this->initRelay), static_cast<int>(relay::IsEnabled()));
+        LogFormat("refreshing network session (relay %d -> %d, post-sleep %d)",
+            static_cast<int>(this->initRelay), static_cast<int>(relay::IsEnabled()),
+            static_cast<int>(this->needsReinit));
         LanEventFunc ev = this->lanEvent;
         this->finalize();  /* failures are logged inside; state is torn down regardless */
         R_RETURN(this->initialize(ev, this->initListening));
@@ -1081,7 +1109,7 @@ namespace ams::mitm::ldn {
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
-        R_TRY(this->refreshRelayMode());
+        R_TRY(this->refreshNetworkSession());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1120,7 +1148,7 @@ namespace ams::mitm::ldn {
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
-        R_TRY(this->refreshRelayMode());
+        R_TRY(this->refreshNetworkSession());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1494,6 +1522,7 @@ namespace ams::mitm::ldn {
         const bool use_relay = relay::IsEnabled();
         this->initRelay = use_relay;
         this->initListening = listening;
+        this->needsReinit = false;
 
         /* Relay mode keeps the console on the INTERNET (so the relay socket
            can reach the server), so skip LocalNetworkMode; the submitted

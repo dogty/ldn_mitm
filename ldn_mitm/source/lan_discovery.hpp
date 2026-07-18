@@ -155,8 +155,10 @@ namespace ams::mitm::ldn {
             int onRead() override;
             /* Close the transport so a HUP'd relay socket (sleep/wake, wifi
                loss) leaves the poll set instead of spinning the worker; the
-               fd goes to -1 and later sends fail harmlessly. */
-            void onClose() override { this->transport.Close(); }
+               fd goes to -1 and later sends fail harmlessly. Also marks the
+               session for rebuild (defined in the .cpp - LANDiscovery is
+               incomplete here). */
+            void onClose() override;
             void keepalive() { this->transport.SendKeepalive(); }
             /* Broadcast a LANPacket (Connect/SyncNetwork) over the relay.
                Relay sends are always broadcasts (sendto ignores the addr), so
@@ -238,11 +240,13 @@ namespace ams::mitm::ldn {
                or Scan reply), for the rate limit above. Guarded by dataMutex. */
             os::Tick lastRelayAdvertise = os::Tick(0);
             /* What initialize() latched, so openAccessPoint/openStation can
-               detect that the overlay toggle changed since and rebuild the
-               session in the right mode (see refreshRelayMode). */
+               detect that the overlay toggle changed since (or that the
+               session was torn down at sleep) and rebuild it in the right
+               mode (see refreshNetworkSession). */
             bool initRelay = false;
             bool initListening = true;
-            Result refreshRelayMode();
+            bool needsReinit = false;
+            Result refreshNetworkSession();
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;

@@ -283,6 +283,14 @@ namespace ams {
            mode is off unless sdmc:/ldn_mitm_relay.cfg names a relay server. */
         mitm::ldn::relay::LoadConfig();
 
+        /* NOTE: an earlier attempt handled sleep proactively via a psc
+           PmModule (ending the session at sleep entry like real ldn).
+           Abandoned: every variant eventually left a psc request
+           unacknowledged around the suspend gap, spsm then failed its
+           sequence and omm ASSERTED (2165-0001) - an unwakeable console.
+           Sleep is instead detected reactively at wake via POLLHUP on the
+           dead sockets (see LDUdpSocket::onClose), which is proven safe. */
+
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,
             mitm::ProcessForServerOnAllThreads,
