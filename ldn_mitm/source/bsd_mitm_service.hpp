@@ -18,6 +18,7 @@
 #include <switch.h>
 #include <stratosphere.hpp>
 #include "debug.hpp"
+#include "ldnmitm_config.hpp"
 #include "interfaces/ibsd_mitm.hpp"
 
 namespace ams::mitm::ldn {
@@ -43,12 +44,18 @@ namespace ams::mitm::ldn {
 
             /* Only mitm real games. bsd is the busiest service on the system;
                never touch sysmodules (and never ldn_mitm's own sockets), so a
-               bug here can only affect application networking, not the OS. */
+               bug here can only affect application networking, not the OS.
+               Also require ldn to be enabled (Tesla overlay): the bsd mitm
+               only exists to serve the broadcast/internet relay, so with ldn
+               off there is nothing for it to do - leave bsd alone entirely,
+               and turning ldn off in the overlay then fully bypasses ldn_mitm.
+               Decision is made at bsd-session open, so toggle before
+               launching the game. */
             static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
-                const bool is_app = ncm::IsApplicationId(client_info.program_id);
+                const bool mitm = ncm::IsApplicationId(client_info.program_id) && LdnConfig::getEnabled();
                 LogFormat("bsd should_mitm pid: %" PRIu64 " tid: %" PRIx64 " -> %d",
-                    client_info.process_id, client_info.program_id, static_cast<int>(is_app));
-                return is_app;
+                    client_info.process_id, client_info.program_id, static_cast<int>(mitm));
+                return mitm;
             }
         public:
             /* Overridden commands. */
